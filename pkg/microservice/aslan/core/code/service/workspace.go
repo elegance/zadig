@@ -17,25 +17,56 @@ limitations under the License.
 package service
 
 import (
-	"context"
 	"io/ioutil"
-	"net/url"
 	"os"
 	"path"
-	"strconv"
-	"strings"
 
-	"github.com/google/go-github/v35/github"
-	"github.com/xanzy/go-gitlab"
 	"go.uber.org/zap"
 
 	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	commonrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/command"
-	"github.com/koderover/zadig/pkg/shared/codehost"
+	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/fs"
+	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/git"
+	"github.com/koderover/zadig/pkg/shared/client/systemconfig"
+	"github.com/koderover/zadig/pkg/tool/codehub"
 	e "github.com/koderover/zadig/pkg/tool/errors"
-	githubtool "github.com/koderover/zadig/pkg/tool/git/github"
 )
+
+func GetPublicRepoTree(repoLink, path string, logger *zap.SugaredLogger) ([]*git.TreeNode, error) {
+	owner, repo, err := git.ParseOwnerAndRepo(repoLink)
+	if err != nil {
+		logger.Errorf("Failed to parse link %s, err: %s", repoLink, err)
+		return nil, e.ErrListWorkspace.AddErr(err)
+	}
+	getter, err := fs.GetPublicTreeGetter(repoLink)
+	if err != nil {
+		logger.Errorf("Failed to get tree getter, err: %s", err)
+		return nil, e.ErrListWorkspace.AddErr(err)
+	}
+
+	fileInfos, err := getter.GetTree(owner, repo, path, "")
+	if err != nil {
+		return nil, e.ErrListWorkspace.AddDesc(err.Error())
+	}
+
+	return fileInfos, nil
+}
+
+func GetRepoTree(codeHostID int, owner, repo, path, branch string, logger *zap.SugaredLogger) ([]*git.TreeNode, error) {
+	getter, err := fs.GetTreeGetter(codeHostID)
+	if err != nil {
+		logger.Errorf("Failed to get tree getter, err: %s", err)
+		return nil, e.ErrListWorkspace.AddDesc(err.Error())
+	}
+
+	fileInfos, err := getter.GetTree(owner, repo, path, branch)
+	if err != nil {
+		return nil, e.ErrListWorkspace.AddDesc(err.Error())
+	}
+
+	return fileInfos, nil
+}
 
 func CleanWorkspace(username, pipelineName string, log *zap.SugaredLogger) error {
 	wsPath, err := getWorkspaceBasePath(pipelineName)
@@ -114,7 +145,7 @@ func GetGitRepoInfo(codehostID int, repoOwner, repoName, branchName, remoteName,
 	if err := os.RemoveAll(base); err != nil {
 		log.Errorf("dir remove err:%v", err)
 	}
-	detail, err := codehost.GetCodehostDetail(codehostID)
+	detail, err := systemconfig.New().GetCodeHost(codehostID)
 	if err != nil {
 		log.Errorf("GetGitRepoInfo GetCodehostDetail err:%v", err)
 		return fis, e.ErrListRepoDir.AddDesc(err.Error())
@@ -147,67 +178,6 @@ func GetGitRepoInfo(codehostID int, repoOwner, repoName, branchName, remoteName,
 	return fis, nil
 }
 
-func GetPublicGitRepoInfo(urlPath, dir string, log *zap.SugaredLogger) ([]*FileInfo, error) {
-	fis := make([]*FileInfo, 0)
-
-	if dir == "" {
-		dir = "/"
-	}
-	if !strings.Contains(urlPath, "https") && !strings.Contains(urlPath, "http") {
-		return fis, e.ErrListRepoDir.AddDesc("url is illegal")
-	}
-	uri, err := url.Parse(urlPath)
-	if err != nil {
-		return fis, e.ErrListRepoDir.AddDesc("url parse failed")
-	}
-	host := uri.Host
-	if host != "github.com" {
-		return fis, e.ErrListRepoDir.AddDesc("only support github")
-	}
-	uriPath := uri.Path
-	repoNameArr := strings.Split(uriPath, "/")
-	repoName := ""
-	if len(repoNameArr) == 3 {
-		repoName = repoNameArr[2]
-	}
-	if repoName == "" {
-		return fis, e.ErrListRepoDir.AddDesc("repoName not found")
-	}
-
-	base := path.Join(config.S3StoragePath(), repoName)
-	if err := os.RemoveAll(base); err != nil {
-		log.Errorf("dir remove err:%v", err)
-	}
-	err = command.RunGitCmds(&codehost.Detail{Address: urlPath, Source: "github"}, "", repoName, "master", "origin")
-	if err != nil {
-		log.Errorf("GetPublicGitRepoInfo runGitCmds err:%v", err)
-		return fis, e.ErrListRepoDir.AddDesc(err.Error())
-	}
-
-	files, err := ioutil.ReadDir(path.Join(base, dir))
-	if err != nil {
-		return fis, e.ErrListRepoDir.AddDesc(err.Error())
-	}
-
-	for _, file := range files {
-		if file.Name() == ".git" && file.IsDir() {
-			continue
-		}
-		fi := &FileInfo{
-			Parent:  dir,
-			Name:    file.Name(),
-			Size:    file.Size(),
-			Mode:    file.Mode(),
-			ModTime: file.ModTime().Unix(),
-			IsDir:   file.IsDir(),
-		}
-
-		fis = append(fis, fi)
-	}
-
-	return fis, nil
-}
-
 type CodehostFileInfo struct {
 	Name     string `json:"name"`
 	Size     int    `json:"size"`
@@ -215,73 +185,29 @@ type CodehostFileInfo struct {
 	FullPath string `json:"full_path"`
 }
 
-func GetGithubRepoInfo(codehostID int, repoName, branchName, path string, log *zap.SugaredLogger) ([]*CodehostFileInfo, error) {
-	fileInfo := make([]*CodehostFileInfo, 0)
-
-	detail, err := codehost.GetCodehostDetail(codehostID)
-	if err != nil {
-		log.Errorf("GetGithubRepoInfo GetCodehostDetail err:%v", err)
-		return fileInfo, e.ErrListWorkspace.AddDesc(err.Error())
-	}
-
-	githubClient := githubtool.NewClient(&githubtool.Config{AccessToken: detail.OauthToken, Proxy: config.ProxyHTTPSAddr()})
-
-	_, dirContent, err := githubClient.GetContents(context.TODO(), detail.Owner, repoName, path, &github.RepositoryContentGetOptions{Ref: branchName})
-	if err != nil {
-		return nil, e.ErrListWorkspace.AddDesc(err.Error())
-	}
-	for _, file := range dirContent {
-		fileInfo = append(fileInfo, &CodehostFileInfo{
-			Name:     file.GetName(),
-			Size:     file.GetSize(),
-			IsDir:    file.GetType() == "dir",
-			FullPath: file.GetPath(),
-		})
-	}
-	return fileInfo, nil
-}
-
-// 获取gitlab的目录内容接口
-func GetGitlabRepoInfo(codehostID int, repoName, branchName, path string, log *zap.SugaredLogger) ([]*CodehostFileInfo, error) {
+// 获取codehub的目录内容接口
+func GetCodehubRepoInfo(codehostID int, repoUUID, branchName, path string, log *zap.SugaredLogger) ([]*CodehostFileInfo, error) {
 	fileInfos := make([]*CodehostFileInfo, 0)
 
-	detail, err := codehost.GetCodehostDetail(codehostID)
+	detail, err := systemconfig.New().GetCodeHost(codehostID)
 	if err != nil {
-		log.Errorf("GetGitlabRepoInfo GetCodehostDetail err:%v", err)
+		log.Errorf("GetCodehubRepoInfo GetCodehostDetail err:%s", err)
 		return fileInfos, e.ErrListWorkspace.AddDesc(err.Error())
 	}
-	gitlabClient, err := gitlab.NewOAuthClient(detail.OauthToken, gitlab.WithBaseURL(detail.Address))
+
+	codeHubClient := codehub.NewCodeHubClient(detail.AccessKey, detail.SecretKey, detail.Region, config.ProxyHTTPSAddr(), detail.EnableProxy)
+	treeNodes, err := codeHubClient.FileTree(repoUUID, branchName, path)
 	if err != nil {
-		log.Errorf("GetGitlabRepoInfo Prepare gitlab client err:%v", err)
-		return fileInfos, e.ErrListWorkspace.AddDesc(err.Error())
+		log.Errorf("Failed to list tree from codehub err:%s", err)
+		return nil, err
 	}
-	nextPage := "1"
-	for nextPage != "" {
-		pagenum, err := strconv.Atoi(nextPage)
-		if err != nil {
-			log.Errorf("Failed to get the amount of entries from gitlab, err: %v", err)
-			return nil, err
-		}
-		opt := &gitlab.ListTreeOptions{
-			ListOptions: gitlab.ListOptions{Page: pagenum},
-			Path:        gitlab.String(path),
-			Ref:         gitlab.String(branchName),
-			Recursive:   gitlab.Bool(false),
-		}
-		treeNodes, resp, err := gitlabClient.Repositories.ListTree(repoName, opt)
-		if err != nil {
-			log.Errorf("Failed to list tree from gitlab")
-			return nil, err
-		}
-		for _, entry := range treeNodes {
-			fileInfos = append(fileInfos, &CodehostFileInfo{
-				Name:     entry.Name,
-				Size:     0,
-				IsDir:    entry.Type == "tree",
-				FullPath: entry.Path,
-			})
-		}
-		nextPage = resp.Header.Get("x-next-page")
+	for _, treeInfo := range treeNodes {
+		fileInfos = append(fileInfos, &CodehostFileInfo{
+			Name:     treeInfo.Name,
+			Size:     0,
+			IsDir:    treeInfo.Type == "tree",
+			FullPath: treeInfo.Path,
+		})
 	}
 	return fileInfos, nil
 }

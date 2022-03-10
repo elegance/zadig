@@ -17,7 +17,6 @@ limitations under the License.
 package taskcontroller
 
 import (
-	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -30,12 +29,15 @@ import (
 
 	configbase "github.com/koderover/zadig/pkg/config"
 	"github.com/koderover/zadig/pkg/microservice/warpdrive/config"
+	"github.com/koderover/zadig/pkg/microservice/warpdrive/core/service/common"
 	plugins "github.com/koderover/zadig/pkg/microservice/warpdrive/core/service/taskplugin"
 	"github.com/koderover/zadig/pkg/microservice/warpdrive/core/service/taskplugin/github"
 	"github.com/koderover/zadig/pkg/microservice/warpdrive/core/service/taskplugin/s3"
 	"github.com/koderover/zadig/pkg/microservice/warpdrive/core/service/types"
 	"github.com/koderover/zadig/pkg/microservice/warpdrive/core/service/types/task"
+	"github.com/koderover/zadig/pkg/setting"
 	"github.com/koderover/zadig/pkg/tool/log"
+	s3tool "github.com/koderover/zadig/pkg/tool/s3"
 	"github.com/koderover/zadig/pkg/util"
 )
 
@@ -43,7 +45,7 @@ import (
 // 1. 转换经过序列化的 SubTasks 到 Stages
 // Stage Map: *Stage -> map [service->subtask]
 func transformToStages(pipelineTask *task.Task, xl *zap.SugaredLogger) error {
-	var pipelineStages []*task.Stage
+	var pipelineStages []*common.Stage
 	// 工作流1.0，单服务工作流，SubTasks一维数组
 	// Transform into stages and assign to stages
 	// Task的数据结构中如果没有赋值Type，也按照1.0处理
@@ -56,7 +58,7 @@ func transformToStages(pipelineTask *task.Task, xl *zap.SugaredLogger) error {
 		}
 		// Pipeline 1.0中的一个Subtask对应到Pipeline 2.0中的一个Stage
 		// Stage中subtasks仅有一个subtask, key为service_name
-		stage := &task.Stage{
+		stage := &common.Stage{
 			TaskType: subTaskPreview.TaskType,
 			// Pipeline 1.0中，每个type subtask只有一个，不存在并行执行
 			RunParallel: false,
@@ -120,10 +122,10 @@ func updatePipelineSubTask(t interface{}, pipelineTask *task.Task, pos int, serv
 		// 同时更新stages
 		// TODO: 完善Stage其他字段
 		if len(pipelineTask.Stages) == 0 {
-			pipelineTask.Stages = make([]*task.Stage, len(pipelineTask.SubTasks))
+			pipelineTask.Stages = make([]*common.Stage, len(pipelineTask.SubTasks))
 		}
 		if pipelineTask.Stages[pos] == nil {
-			pipelineTask.Stages[pos] = &task.Stage{}
+			pipelineTask.Stages[pos] = &common.Stage{}
 		}
 		pipelineTask.Stages[pos].SubTasks = map[string]map[string]interface{}{servicename: subTask}
 	} else if pipelineTask.Type == config.WorkflowType {
@@ -135,6 +137,12 @@ func updatePipelineSubTask(t interface{}, pipelineTask *task.Task, pos int, serv
 	} else if pipelineTask.Type == config.ServiceType {
 		xl.Info("pipeline type is service type: pipeline 3.0")
 		pipelineTask.Stages[pos].SubTasks[servicename] = subTask
+	} else if pipelineTask.Type == config.WorkflowTypeV3 {
+		xl.Info("pipeline type is workflow type: pipeline 3.0")
+		pipelineTask.Stages[pos].SubTasks[servicename] = subTask
+	} else if pipelineTask.Type == config.ArtifactType {
+		xl.Info("pipeline type is artifact-package type: pipeline 3.0")
+		pipelineTask.Stages[pos].SubTasks[servicename] = subTask
 	}
 }
 
@@ -143,7 +151,7 @@ func updatePipelineSubTask(t interface{}, pipelineTask *task.Task, pos int, serv
 func updatePipelineStageStatus(stageStatus config.Status, pipelineTask *task.Task, pos int, xl *zap.SugaredLogger) {
 	xl.Infof("updating pipeline task, stage status: %s, stage position: %d", stageStatus, pos)
 	if pipelineTask.Stages[pos] == nil {
-		pipelineTask.Stages[pos] = &task.Stage{}
+		pipelineTask.Stages[pos] = &common.Stage{}
 	}
 	pipelineTask.Stages[pos].Status = stageStatus
 }
@@ -214,6 +222,8 @@ func getCheckStatus(status config.Status) github.CIStatus {
 	case config.StatusPassed:
 		return github.CIStatusSuccess
 	case config.StatusSkipped:
+		return github.CIStatusCancelled
+	case config.StatusCancelled:
 		return github.CIStatusCancelled
 	default:
 		return github.CIStatusError
@@ -480,6 +490,15 @@ func downloadReport(taskInfo *task.Task, fileName, testName string, logger *zap.
 		logger.Errorf("failed to create s3 storage %s", taskInfo.StorageURI)
 		return nil, err
 	}
+	forcedPathStyle := true
+	if store.Provider == setting.ProviderSourceAli {
+		forcedPathStyle = false
+	}
+	client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
+	if err != nil {
+		logger.Errorf("failed to create s3 client, error: %+v", err)
+		return nil, err
+	}
 	if store.Subfolder != "" {
 		store.Subfolder = fmt.Sprintf("%s/%s/%d/%s", store.Subfolder, taskInfo.PipelineName, taskInfo.TaskID, "test")
 	} else {
@@ -490,8 +509,8 @@ func downloadReport(taskInfo *task.Task, fileName, testName string, logger *zap.
 	defer func() {
 		_ = os.Remove(tmpFilename)
 	}()
-
-	if err = s3.Download(context.Background(), store, fileName, tmpFilename); err == nil {
+	objectKey := store.GetObjectPath(fileName)
+	if err = client.Download(store.Bucket, objectKey, tmpFilename); err == nil {
 		testRepo := new(types.TestSuite)
 		b, err := ioutil.ReadFile(tmpFilename)
 		if err != nil {
@@ -526,16 +545,21 @@ func getSubTaskTypeAndIsRestart(subTask map[string]interface{}) bool {
 
 func initTaskPlugins(execHandler *ExecHandler) {
 	pluginConf := map[config.TaskType]plugins.Initiator{
-		config.TaskJira:           plugins.InitializeJiraTaskPlugin,
-		config.TaskBuild:          plugins.InitializeBuildTaskPlugin,
-		config.TaskJenkinsBuild:   plugins.InitializeJenkinsBuildPlugin,
-		config.TaskDockerBuild:    plugins.InitializeDockerBuildTaskPlugin,
-		config.TaskDeploy:         plugins.InitializeDeployTaskPlugin,
-		config.TaskTestingV2:      plugins.InitializeTestTaskPlugin,
-		config.TaskSecurity:       plugins.InitializeSecurityPlugin,
-		config.TaskReleaseImage:   plugins.InitializeReleaseImagePlugin,
-		config.TaskDistributeToS3: plugins.InitializeDistribute2S3TaskPlugin,
-		config.TaskResetImage:     plugins.InitializeDeployTaskPlugin,
+		config.TaskJira:            plugins.InitializeJiraTaskPlugin,
+		config.TaskBuild:           plugins.InitializeBuildTaskPlugin,
+		config.TaskBuildV3:         plugins.InitializeBuildTaskV3Plugin,
+		config.TaskArtifactDeploy:  plugins.InitializeArtifactTaskPlugin,
+		config.TaskJenkinsBuild:    plugins.InitializeJenkinsBuildPlugin,
+		config.TaskDockerBuild:     plugins.InitializeDockerBuildTaskPlugin,
+		config.TaskDeploy:          plugins.InitializeDeployTaskPlugin,
+		config.TaskTestingV2:       plugins.InitializeTestTaskPlugin,
+		config.TaskSecurity:        plugins.InitializeSecurityPlugin,
+		config.TaskReleaseImage:    plugins.InitializeReleaseImagePlugin,
+		config.TaskDistributeToS3:  plugins.InitializeDistribute2S3TaskPlugin,
+		config.TaskResetImage:      plugins.InitializeDeployTaskPlugin,
+		config.TaskTrigger:         plugins.InitializeTriggerTaskPlugin,
+		config.TaskArtifactPackage: plugins.InitializeArtifactPackagePlugin,
+		config.TaskExtension:       plugins.InitializeExtensionTaskPlugin,
 	}
 	for name, pluginInitiator := range pluginConf {
 		registerTaskPlugin(execHandler, name, pluginInitiator)

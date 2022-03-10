@@ -48,17 +48,7 @@ type SvcRevision struct {
 	Updatable       bool                      `json:"updatable"`
 	Deleted         bool                      `json:"deleted"`
 	New             bool                      `json:"new"`
-	ConfigRevisions []*ConfigRevision         `json:"configs,omitempty"`
 	Containers      []*commonmodels.Container `json:"containers,omitempty"`
-}
-
-type ConfigRevision struct {
-	ConfigName      string `json:"config_name"`
-	CurrentRevision int64  `json:"current_revision"`
-	NextRevision    int64  `json:"next_revision"`
-	Updatable       bool   `json:"updatable"`
-	Deleted         bool   `json:"deleted"`
-	New             bool   `json:"new"`
 }
 
 type ProductIngressInfo struct {
@@ -115,18 +105,6 @@ func (pr *ProductRevision) GroupsUpdated() bool {
 	return pr.Updatable
 }
 
-func (sr *SvcRevision) ConfigsUpdated() bool {
-	if sr.ConfigRevisions == nil || len(sr.ConfigRevisions) == 0 {
-		return false
-	}
-	for _, configRev := range sr.ConfigRevisions {
-		if configRev.Updatable {
-			return true
-		}
-	}
-	return sr.Updatable
-}
-
 type ContainerNotFound struct {
 	ServiceName string
 	Container   string
@@ -136,4 +114,9 @@ type ContainerNotFound struct {
 
 func (c *ContainerNotFound) Error() string {
 	return fmt.Sprintf("serviceName:%s,container:%s", c.ServiceName, c.Container)
+}
+
+type NodeResp struct {
+	Nodes  []*internalresource.Node `json:"data"`
+	Labels []string                 `json:"labels"`
 }

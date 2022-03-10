@@ -17,6 +17,7 @@ limitations under the License.
 package handler
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -43,19 +44,30 @@ func ListDeliveryArtifacts(c *gin.Context) {
 	args.Source = c.Query("source")
 
 	perPageStr := c.Query("per_page")
-	perPage := 0
+	pageStr := c.Query("page")
+	var (
+		err     error
+		perPage int
+		page    int
+	)
 	if perPageStr == "" {
 		perPage = 20
 	} else {
-		perPage, _ = strconv.Atoi(perPageStr)
+		perPage, err = strconv.Atoi(perPageStr)
+		if err != nil {
+			ctx.Err = e.ErrInvalidParam.AddDesc(fmt.Sprintf("perPage args err :%s", err))
+			return
+		}
 	}
 
-	pageStr := c.Query("page")
-	page := 0
 	if pageStr == "" {
 		page = 1
 	} else {
-		page, _ = strconv.Atoi(pageStr)
+		page, err = strconv.Atoi(pageStr)
+		if err != nil {
+			ctx.Err = e.ErrInvalidParam.AddDesc(fmt.Sprintf("page args err :%s", err))
+			return
+		}
 	}
 	args.PerPage = perPage
 	args.Page = page
@@ -63,6 +75,22 @@ func ListDeliveryArtifacts(c *gin.Context) {
 	artifacts, total, err := deliveryservice.ListDeliveryArtifacts(args, ctx.Logger)
 	c.Writer.Header().Add("X-Total", strconv.Itoa(total))
 	ctx.Resp, ctx.Err = artifacts, err
+}
+
+func GetDeliveryArtifactIDByImage(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	image := c.Query("image")
+	if image == "" {
+		ctx.Err = e.ErrInvalidParam.AddDesc("image can't be empty!")
+		return
+	}
+	args := &commonrepo.DeliveryArtifactArgs{
+		Image: image,
+	}
+
+	ctx.Resp, ctx.Err = deliveryservice.GetDeliveryArtifactIDByImage(args, ctx.Logger)
 }
 
 func GetDeliveryArtifact(c *gin.Context) {
@@ -77,7 +105,6 @@ func GetDeliveryArtifact(c *gin.Context) {
 	args := &commonrepo.DeliveryArtifactArgs{
 		ID: id,
 	}
-	args.ID = id
 
 	ctx.Resp, ctx.Err = deliveryservice.GetDeliveryArtifact(args, ctx.Logger)
 }

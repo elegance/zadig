@@ -22,16 +22,20 @@ import (
 
 	"go.uber.org/zap"
 	"helm.sh/helm/v3/pkg/releaseutil"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"k8s.io/client-go/informers"
 
+	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	commonmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	commonrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
 	commonservice "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/kube"
 	"github.com/koderover/zadig/pkg/setting"
+	kubeclient "github.com/koderover/zadig/pkg/shared/kube/client"
 	"github.com/koderover/zadig/pkg/shared/kube/resource"
 	"github.com/koderover/zadig/pkg/shared/kube/wrapper"
 	e "github.com/koderover/zadig/pkg/tool/errors"
+	"github.com/koderover/zadig/pkg/tool/kube/getter"
+	"github.com/koderover/zadig/pkg/tool/kube/informer"
 	"github.com/koderover/zadig/pkg/tool/kube/serializer"
 	"github.com/koderover/zadig/pkg/util"
 )
@@ -65,7 +69,12 @@ func ListGroups(serviceName, envName, productName string, perPage, page int, log
 	//将获取到的所有服务按照名称进行排序
 	sort.SliceStable(allServices, func(i, j int) bool { return allServices[i].ServiceName < allServices[j].ServiceName })
 
-	kubeClient, err := kube.GetKubeClient(productInfo.ClusterID)
+	cls, err := kubeclient.GetKubeClientSet(config.HubServerAddress(), productInfo.ClusterID)
+	if err != nil {
+		log.Errorf("[%s][%s] error: %v", envName, productName, err)
+		return resp, count, e.ErrListGroups.AddDesc(err.Error())
+	}
+	inf, err := informer.NewInformer(productInfo.ClusterID, productInfo.Namespace, cls)
 	if err != nil {
 		log.Errorf("[%s][%s] error: %v", envName, productName, err)
 		return resp, count, e.ErrListGroups.AddDesc(err.Error())
@@ -73,14 +82,14 @@ func ListGroups(serviceName, envName, productName string, perPage, page int, log
 
 	//这种针对的是获取所有数据的接口，内部调用
 	if page == 0 && perPage == 0 {
-		resp = envHandleFunc(getProjectType(productName), log).listGroupServices(allServices, envName, productName, kubeClient, productInfo)
+		resp = envHandleFunc(getProjectType(productName), log).listGroupServices(allServices, envName, productName, inf, productInfo)
 		return resp, count, nil
 	}
 
 	//针对获取环境状态的接口请求，这里不需要一次性获取所有的服务，先获取十条的数据，有异常的可以直接返回，不需要继续往下获取
 	if page == -1 && perPage == -1 {
 		// 获取环境的状态
-		resp = listGroupServiceStatus(allServices, envName, productName, kubeClient, productInfo, log)
+		resp = listGroupServiceStatus(allServices, envName, productName, inf, productInfo, log)
 		return resp, count, nil
 	}
 
@@ -93,11 +102,11 @@ func ListGroups(serviceName, envName, productName string, perPage, page int, log
 		}
 		currentServices = allServices[currentPage*perPage:]
 	}
-	resp = envHandleFunc(getProjectType(productName), log).listGroupServices(currentServices, envName, productName, kubeClient, productInfo)
+	resp = envHandleFunc(getProjectType(productName), log).listGroupServices(currentServices, envName, productName, inf, productInfo)
 	return resp, count, nil
 }
 
-func listGroupServiceStatus(allServices []*commonmodels.ProductService, envName, productName string, kubeClient client.Client, productInfo *commonmodels.Product, log *zap.SugaredLogger) []*commonservice.ServiceResp {
+func listGroupServiceStatus(allServices []*commonmodels.ProductService, envName, productName string, informer informers.SharedInformerFactory, productInfo *commonmodels.Product, log *zap.SugaredLogger) []*commonservice.ServiceResp {
 	var (
 		count           = len(allServices)
 		currentServices = make([]*commonmodels.ProductService, 0)
@@ -110,7 +119,7 @@ func listGroupServiceStatus(allServices []*commonmodels.ProductService, envName,
 		} else {
 			currentServices = allServices[page*perPage:]
 		}
-		resp = envHandleFunc(getProjectType(productName), log).listGroupServices(currentServices, envName, productName, kubeClient, productInfo)
+		resp = envHandleFunc(getProjectType(productName), log).listGroupServices(currentServices, envName, productName, informer, productInfo)
 		allRunning := true
 		for _, serviceResp := range resp {
 			// Service是物理机部署时，无需判断状态
@@ -149,13 +158,29 @@ func GetIngressInfo(product *commonmodels.Product, service *commonmodels.Service
 	parsedYaml = util.ReplaceWrapLine(parsedYaml)
 	yamlContentArray := releaseutil.SplitManifests(parsedYaml)
 	hostInfos := make([]resource.HostInfo, 0)
+
 	for _, item := range yamlContentArray {
-		ing, err := serializer.NewDecoder().YamlToIngress([]byte(item))
-		if err != nil || ing == nil {
+		u, err := serializer.NewDecoder().YamlToUnstructured([]byte(item))
+		if err != nil {
+			log.Warnf("Failed to decode yaml to Unstructured, err: %s", err)
 			continue
 		}
-
-		hostInfos = append(hostInfos, wrapper.Ingress(ing).HostInfo()...)
+		switch u.GetKind() {
+		case setting.Ingress:
+			kubeClient, err := kubeclient.GetKubeClient(config.HubServerAddress(), product.ClusterID)
+			if err != nil {
+				log.Errorf("failed to init kubeClient, clusterID: %s", product.ClusterID)
+				return nil
+			}
+			// need to get ingress from k8s
+			// serializer.NewDecoder()YamlToIngress() only supports ingress resource with apiVersion: apiVersion: extensions/v1beta1
+			ing, found, err := getter.GetIngress(product.Namespace, u.GetName(), kubeClient)
+			if err != nil || !found {
+				log.Warnf("no ingress %s found in %s:%s %v", u.GetName(), service.ServiceName, product.Namespace, err)
+				continue
+			}
+			hostInfos = append(hostInfos, wrapper.Ingress(ing).HostInfo()...)
+		}
 	}
 	ingressInfo.HostInfo = hostInfos
 	return ingressInfo

@@ -17,6 +17,7 @@ limitations under the License.
 package handler
 
 import (
+	"context"
 	"strconv"
 	"strings"
 
@@ -36,7 +37,7 @@ func GetBuildJobContainerLogs(c *gin.Context) {
 		ctx.Err = e.ErrInvalidParam.AddDesc("invalid task id")
 		return
 	}
-	// job名称使用全小写，避免出现subdomain错误
+	// Use all lowercase job names to avoid subdomain errors
 	ctx.Resp, ctx.Err = logservice.GetBuildJobContainerLogs(
 		c.Param("pipelineName"),
 		c.Param("serviceName"),
@@ -54,7 +55,7 @@ func GetWorkflowBuildJobContainerLogs(c *gin.Context) {
 		ctx.Err = e.ErrInvalidParam.AddDesc("invalid task id")
 		return
 	}
-	// job名称使用全小写，避免出现subdomain错误
+	// Use all lowercase job names to avoid subdomain errors
 	ctx.Resp, ctx.Err = logservice.GetWorkflowBuildJobContainerLogs(strings.ToLower(c.Param("pipelineName")), c.Param("serviceName"), c.Query("type"), taskID, ctx.Logger)
 }
 
@@ -68,7 +69,7 @@ func GetTestJobContainerLogs(c *gin.Context) {
 		return
 	}
 
-	// job名称使用全小写，避免出现subdomain错误
+	// Use all lowercase job names to avoid subdomain errors
 	ctx.Resp, ctx.Err = logservice.GetTestJobContainerLogs(c.Param("pipelineName"), c.Param("testName"), taskID, ctx.Logger)
 }
 
@@ -82,6 +83,48 @@ func GetWorkflowTestJobContainerLogs(c *gin.Context) {
 		return
 	}
 
-	// job名称使用全小写，避免出现subdomain错误
+	// Use all lowercase job names to avoid subdomain errors
 	ctx.Resp, ctx.Err = logservice.GetWorkflowTestJobContainerLogs(c.Param("pipelineName"), c.Param("serviceName"), c.Query("workflowType"), taskID, ctx.Logger)
+}
+
+func GetContainerLogs(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	podName := c.Param("name")
+	containerName := c.Query("container")
+	envName := c.Query("envName")
+	productName := c.Query("projectName")
+
+	tailLines, err := strconv.ParseInt(c.Query("tailLines"), 10, 64)
+	if err != nil {
+		tailLines = int64(-1)
+	}
+
+	follow, err := strconv.ParseBool(c.Query("follow"))
+	if err != nil {
+		follow = false
+	}
+
+	if !follow {
+		ctx.Resp, ctx.Err = logservice.GetCurrentContainerLogs(podName, containerName, envName, productName, tailLines, ctx.Logger)
+		return
+	}
+
+	internalhandler.Stream(c, func(ctx1 context.Context, streamChan chan interface{}) {
+		logservice.ContainerLogStream(ctx1, streamChan, envName, productName, podName, containerName, follow, tailLines, ctx.Logger)
+	}, ctx.Logger)
+}
+
+func GetWorkflowBuildV3JobContainerLogs(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	taskID, err := strconv.ParseInt(c.Param("taskId"), 10, 64)
+	if err != nil {
+		ctx.Err = e.ErrInvalidParam.AddDesc("invalid task id")
+		return
+	}
+	// Use all lowercase job names to avoid subdomain errors
+	ctx.Resp, ctx.Err = logservice.GetWorkflowBuildV3JobContainerLogs(strings.ToLower(c.Param("workflowName")), c.Query("type"), taskID, ctx.Logger)
 }

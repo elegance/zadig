@@ -17,11 +17,15 @@ limitations under the License.
 package webhook
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path"
 	"strings"
+	"sync"
 
+	"github.com/google/go-github/v35/github"
+	"github.com/hashicorp/go-multierror"
 	"github.com/xanzy/go-gitlab"
 	"go.uber.org/zap"
 	"helm.sh/helm/v3/pkg/releaseutil"
@@ -30,65 +34,71 @@ import (
 	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	commonmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	commonrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
-	githubservice "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/github"
-	gitlabservice "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/gitlab"
+	templaterepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb/template"
+	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/codehub"
+	"github.com/koderover/zadig/pkg/microservice/aslan/core/service/service"
 	"github.com/koderover/zadig/pkg/setting"
-	"github.com/koderover/zadig/pkg/shared/codehost"
+	"github.com/koderover/zadig/pkg/shared/client/systemconfig"
 	e "github.com/koderover/zadig/pkg/tool/errors"
+	githubtool "github.com/koderover/zadig/pkg/tool/git/github"
 	gitlabtool "github.com/koderover/zadig/pkg/tool/git/gitlab"
 	"github.com/koderover/zadig/pkg/tool/kube/serializer"
 	"github.com/koderover/zadig/pkg/tool/log"
 	"github.com/koderover/zadig/pkg/util"
 )
 
-type yamlGetter interface {
-	GetYAMLContents(owner, repo, branch, path string, isDir, split bool) ([]string, error)
-}
-
-func newGetter(source, address, owner string) (yamlGetter, error) {
-	ch, err := codehost.GetCodeHostInfo(
-		&codehost.Option{CodeHostType: source, Address: address, Namespace: owner})
-	if err != nil {
-		return nil, err
-	}
-	switch source {
-	case setting.SourceFromGithub:
-		return githubservice.NewClient(ch.AccessToken, config.ProxyHTTPSAddr()), nil
-	case setting.SourceFromGitlab:
-		return gitlabservice.NewClient(ch.Address, ch.AccessToken)
-	default:
-		// should not have happened here
-		log.DPanicf("invalid source: %s", source)
-		return nil, fmt.Errorf("invalid source: %s", source)
-	}
-}
-
 func syncContent(args *commonmodels.Service, logger *zap.SugaredLogger) error {
-	address, owner, repo, branch, path, pathType, err := GetOwnerRepoBranchPath(args.SrcPath)
+	address, _, repo, branch, path, pathType, err := GetOwnerRepoBranchPath(args.SrcPath)
 	if err != nil {
 		logger.Errorf("Failed to parse url %s, err: %s", args.SrcPath, err)
 		return fmt.Errorf("url parse failure, err: %s", err)
 	}
 
-	getter, err := newGetter(args.Source, address, owner)
-	if err != nil {
-		logger.Errorf("Failed to create new getter, error: %s", err)
-		return err
+	var yamls []string
+	switch args.Source {
+	case setting.SourceFromCodeHub:
+		client, err := getCodehubClientByAddress(address)
+		if err != nil {
+			logger.Errorf("Failed to get codehub client, error: %s", err)
+			return err
+		}
+		repoUUID, err := client.GetRepoUUID(repo)
+		if err != nil {
+			logger.Errorf("Failed to get repoUUID, error: %s", err)
+			return err
+		}
+		yamls, err = client.GetYAMLContents(repoUUID, branch, path, pathType == "tree", true)
+		if err != nil {
+			logger.Errorf("Failed to get yamls, error: %s", err)
+			return err
+		}
 	}
 
-	yamls, err := getter.GetYAMLContents(owner, repo, branch, path, pathType != "blob", true)
-	if err != nil {
-		logger.Errorf("Failed to get yamls, error: %s", err)
-		return err
-	}
 	args.KubeYamls = yamls
 	args.Yaml = util.CombineManifests(yamls)
 
 	return nil
 }
 
+func reloadServiceTmplFromGit(svc *commonmodels.Service, log *zap.SugaredLogger) error {
+	_, err := service.CreateOrUpdateHelmServiceFromGitRepo(svc.ProductName, &service.HelmServiceCreationArgs{
+		HelmLoadSource: service.HelmLoadSource{
+			Source: service.LoadFromRepo,
+		},
+		CreatedBy: svc.CreateBy,
+		CreateFrom: &service.CreateFromRepo{
+			CodehostID: svc.CodehostID,
+			Owner:      svc.RepoOwner,
+			Repo:       svc.RepoName,
+			Branch:     svc.BranchName,
+			Paths:      []string{svc.LoadPath},
+		},
+	}, log)
+	return err
+}
+
 // fillServiceTmpl 更新服务模板参数
-func fillServiceTmpl(args *commonmodels.Service, log *zap.SugaredLogger) error {
+func fillServiceTmpl(userName string, args *commonmodels.Service, log *zap.SugaredLogger) error {
 	if args == nil {
 		return errors.New("service template arg is null")
 	}
@@ -111,14 +121,20 @@ func fillServiceTmpl(args *commonmodels.Service, log *zap.SugaredLogger) error {
 			}
 			// 从Gitlab同步args指定的Commit下，指定目录中对应的Yaml文件
 			// Set args.Yaml & args.KubeYamls
-			if err := syncContent(args, log); err != nil {
+			if err := syncContentFromGitlab(userName, args); err != nil {
 				log.Errorf("Sync content from gitlab failed, error: %v", err)
 				return err
 			}
 		} else if args.Source == setting.SourceFromGithub {
-			err := syncContent(args, log)
+			err := syncContentFromGithub(args, log)
 			if err != nil {
 				log.Errorf("Sync content from github failed, error: %v", err)
+				return err
+			}
+		} else if args.Source == setting.SourceFromCodeHub {
+			err := syncContent(args, log)
+			if err != nil {
+				log.Errorf("Sync content from codehub failed, error: %v", err)
 				return err
 			}
 		} else {
@@ -126,25 +142,47 @@ func fillServiceTmpl(args *commonmodels.Service, log *zap.SugaredLogger) error {
 			// 替换分隔符
 			args.Yaml = util.ReplaceWrapLine(args.Yaml)
 			// 分隔符为\n---\n
-			args.KubeYamls = util.SplitManifests(args.Yaml)
+			args.KubeYamls = SplitYaml(args.Yaml)
 		}
 
 		// 遍历args.KubeYamls，获取 Deployment 或者 StatefulSet 里面所有containers 镜像和名称
 		if err := setCurrentContainerImages(args); err != nil {
 			return err
 		}
-
 		log.Infof("find %d containers in service %s", len(args.Containers), args.ServiceName)
-	}
 
-	// 设置新的版本号
-	serviceTemplate := fmt.Sprintf(setting.ServiceTemplateCounterName, args.ServiceName, args.Type)
-	rev, err := commonrepo.NewCounterColl().GetNextSeq(serviceTemplate)
-	if err != nil {
-		return fmt.Errorf("get next service template revision error: %v", err)
-	}
+		// generate new revision
+		serviceTemplate := fmt.Sprintf(setting.ServiceTemplateCounterName, args.ServiceName, args.ProductName)
+		rev, err := commonrepo.NewCounterColl().GetNextSeq(serviceTemplate)
+		if err != nil {
+			return fmt.Errorf("get next service template revision error: %v", err)
+		}
 
-	args.Revision = rev
+		args.Revision = rev
+		// update service template
+		if err := commonrepo.NewServiceColl().Create(args); err != nil {
+			log.Errorf("Failed to sync service %s from github path %s error: %v", args.ServiceName, args.SrcPath, err)
+			return e.ErrCreateTemplate.AddDesc(err.Error())
+		}
+	} else if args.Type == setting.HelmDeployType {
+		if args.Source == setting.SourceFromGitlab {
+			// Set args.Commit
+			if err := syncLatestCommit(args); err != nil {
+				log.Errorf("Sync change log from gitlab failed, error: %s", err)
+				return err
+			}
+
+			if err := reloadServiceTmplFromGit(args, log); err != nil {
+				log.Errorf("Sync content from gitlab failed, error: %s", err)
+				return err
+			}
+		} else if args.Source == setting.SourceFromGithub {
+			if err := reloadServiceTmplFromGit(args, log); err != nil {
+				log.Errorf("Sync content from github failed, error: %s", err)
+				return err
+			}
+		}
+	}
 
 	return nil
 }
@@ -164,28 +202,80 @@ func syncLatestCommit(service *commonmodels.Service) error {
 		return err
 	}
 
+	if len(service.BranchName) > 0 {
+		branch = service.BranchName
+	}
+	if len(service.LoadPath) > 0 {
+		path = service.LoadPath
+	}
+
 	commit, err := GitlabGetLatestCommit(client, owner, repo, branch, path)
 	if err != nil {
 		return err
 	}
+
+	if commit != nil {
+		service.Commit = &commonmodels.Commit{
+			SHA:     commit.ID,
+			Message: commit.Message,
+		}
+	}
+
+	return nil
+}
+
+func syncCodehubLatestCommit(service *commonmodels.Service) error {
+	if service.SrcPath == "" {
+		return fmt.Errorf("url不能是空的")
+	}
+
+	address, owner, repo, branch, _, _, err := GetOwnerRepoBranchPath(service.SrcPath)
+	if err != nil {
+		return fmt.Errorf("url 必须包含 owner/repo/tree/branch/path，具体请参考 Placeholder 提示")
+	}
+
+	client, err := getCodehubClientByAddress(address)
+	if err != nil {
+		return err
+	}
+
+	id, message, err := CodehubGetLatestCommit(client, owner, repo, branch)
+	if err != nil {
+		return err
+	}
 	service.Commit = &commonmodels.Commit{
-		SHA:     commit.ID,
-		Message: commit.Message,
+		SHA:     id,
+		Message: message,
 	}
 	return nil
 }
 
-func getGitlabClientByAddress(address string) (*gitlabtool.Client, error) {
-	opt := &codehost.Option{
+func getCodehubClientByAddress(address string) (*codehub.Client, error) {
+	opt := &systemconfig.Option{
 		Address:      address,
-		CodeHostType: codehost.GitLabProvider,
+		CodeHostType: systemconfig.CodeHubProvider,
 	}
-	codehost, err := codehost.GetCodeHostInfo(opt)
+	codehost, err := systemconfig.GetCodeHostInfo(opt)
 	if err != nil {
 		log.Error(err)
 		return nil, e.ErrCodehostListProjects.AddDesc("git client is nil")
 	}
-	client, err := gitlabtool.NewClient(codehost.Address, codehost.AccessToken)
+	client := codehub.NewClient(codehost.AccessKey, codehost.SecretKey, codehost.Region, config.ProxyHTTPSAddr(), codehost.EnableProxy)
+
+	return client, nil
+}
+
+func getGitlabClientByAddress(address string) (*gitlabtool.Client, error) {
+	opt := &systemconfig.Option{
+		Address:      address,
+		CodeHostType: systemconfig.GitLabProvider,
+	}
+	codehost, err := systemconfig.GetCodeHostInfo(opt)
+	if err != nil {
+		log.Error(err)
+		return nil, e.ErrCodehostListProjects.AddDesc("git client is nil")
+	}
+	client, err := gitlabtool.NewClient(codehost.Address, codehost.AccessToken, config.ProxyHTTPSAddr(), codehost.EnableProxy)
 	if err != nil {
 		log.Error(err)
 		return nil, e.ErrCodehostListProjects.AddDesc(err.Error())
@@ -195,12 +285,163 @@ func getGitlabClientByAddress(address string) (*gitlabtool.Client, error) {
 }
 
 func GitlabGetLatestCommit(client *gitlabtool.Client, owner, repo string, ref, path string) (*gitlab.Commit, error) {
-	commit, err := client.GetLatestRepositoryCommit(owner, repo, ref, path)
+	commit, err := client.GetLatestRepositoryCommit(owner, repo, path, ref)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get lastest commit with project %s/%s, ref: %s, path:%s, error: %v",
 			owner, repo, ref, path, err)
 	}
 	return commit, nil
+}
+
+func CodehubGetLatestCommit(client *codehub.Client, owner, repo string, branch string) (string, string, error) {
+	commit, err := client.GetLatestRepositoryCommit(owner, repo, branch)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get lastest commit with project %s/%s, ref: %s, error: %s",
+			owner, repo, branch, err)
+	}
+	return commit.ID, commit.Message, nil
+}
+
+// GitlabGetRawFiles ...
+// projectID: identity of project, can be retrieved from s.GitlabGetProjectID(owner, repo)
+// ref: branch (e.g. master) or commit (commit id) or tag
+// path: file path of raw files, only retrieve leaf node(blob type == file), no recursive get
+func GitlabGetRawFiles(client *gitlabtool.Client, owner, repo, ref, path, pathType string) (files []string, err error) {
+	files = make([]string, 0)
+	var errs *multierror.Error
+	if pathType == "tree" {
+		nodes, err := client.ListTree(owner, repo, path, ref, false, nil)
+		if err != nil {
+			return files, err
+		}
+		for _, node := range nodes {
+			// if node type is "tree", it is a directory, skip it for now
+			if node.Type == "tree" {
+				continue
+			}
+			fileName := strings.ToLower(node.Name)
+			if !strings.HasSuffix(fileName, ".yaml") && !strings.HasSuffix(fileName, ".yml") {
+				continue
+			}
+			// if node type is "blob", it is a file
+			// Path is filepath of a node
+			content, err := client.GetRawFile(owner, repo, ref, node.Path)
+			if err != nil {
+				errs = multierror.Append(errs, err)
+			}
+			contentStr := string(content)
+			contentStr = util.ReplaceWrapLine(contentStr)
+			files = append(files, contentStr)
+		}
+		return files, errs.ErrorOrNil()
+	}
+	content, err := client.GetFileContent(owner, repo, path, ref)
+	if err != nil {
+		return files, err
+	}
+	files = append(files, string(content))
+	return files, errs.ErrorOrNil()
+}
+
+// syncContentFromGitlab ...
+// sync content with commit, args.Commit should not be nil
+func syncContentFromGitlab(userName string, args *commonmodels.Service) error {
+	if args.Commit == nil {
+		return nil
+	}
+
+	address, owner, repo, branch, path, pathType, err := GetOwnerRepoBranchPath(args.SrcPath)
+	if err != nil {
+		return fmt.Errorf("url format failed")
+	}
+
+	client, err := getGitlabClientByAddress(address)
+	if err != nil {
+		return err
+	}
+
+	files, err := GitlabGetRawFiles(client, owner, repo, branch, path, pathType)
+	if err != nil {
+		return err
+	}
+	if userName != setting.WebhookTaskCreator {
+		if len(files) == 0 {
+			return fmt.Errorf("没有检索到yml,yaml类型文件，请检查目录是否正确")
+		}
+	}
+	// KubeYamls field is dynamicly synced.
+	// 根据gitlab sync的内容来设置args.KubeYamls
+	args.KubeYamls = files
+	// 拼装并设置args.Yaml
+	args.Yaml = joinYamls(files)
+	return nil
+}
+
+func joinYamls(files []string) string {
+	return strings.Join(files, setting.YamlFileSeperator)
+}
+
+func syncContentFromGithub(args *commonmodels.Service, log *zap.SugaredLogger) error {
+	// 根据pipeline中的filepath获取文件内容
+	address, owner, repo, branch, path, _, err := GetOwnerRepoBranchPath(args.SrcPath)
+	if err != nil {
+		log.Errorf("GetOwnerRepoBranchPath failed, srcPath:%s, err:%v", args.SrcPath, err)
+		return errors.New("invalid url " + args.SrcPath)
+	}
+
+	ch, err := systemconfig.GetCodeHostInfo(
+		&systemconfig.Option{CodeHostType: systemconfig.GitHubProvider, Address: address, Namespace: owner})
+	if err != nil {
+		log.Errorf("GetCodeHostInfo failed, srcPath:%s, err:%v", args.SrcPath, err)
+		return err
+	}
+
+	gc := githubtool.NewClient(&githubtool.Config{AccessToken: ch.AccessToken, Proxy: config.ProxyHTTPSAddr()})
+	fileContent, directoryContent, err := gc.GetContents(context.TODO(), owner, repo, path, &github.RepositoryContentGetOptions{Ref: branch})
+	if fileContent != nil {
+		svcContent, _ := fileContent.GetContent()
+		splitYaml := SplitYaml(svcContent)
+		args.KubeYamls = splitYaml
+		args.Yaml = svcContent
+	} else {
+		var files []string
+		for _, f := range directoryContent {
+			// 排除目录
+			if *f.Type != "file" {
+				continue
+			}
+			fileName := strings.ToLower(*f.Path)
+			if !strings.HasSuffix(fileName, ".yaml") && !strings.HasSuffix(fileName, ".yml") {
+				continue
+			}
+
+			file, err := syncSingleFileFromGithub(owner, repo, branch, *f.Path, ch.AccessToken)
+			if err != nil {
+				log.Errorf("syncSingleFileFromGithub failed, path: %s, err: %v", *f.Path, err)
+				continue
+			}
+			files = append(files, file)
+		}
+
+		args.KubeYamls = files
+		args.Yaml = joinYamls(files)
+	}
+
+	return nil
+}
+
+func SplitYaml(yaml string) []string {
+	return strings.Split(yaml, setting.YamlFileSeperator)
+}
+
+func syncSingleFileFromGithub(owner, repo, branch, path, token string) (string, error) {
+	gc := githubtool.NewClient(&githubtool.Config{AccessToken: token, Proxy: config.ProxyHTTPSAddr()})
+	fileContent, _, err := gc.GetContents(context.TODO(), owner, repo, path, &github.RepositoryContentGetOptions{Ref: branch})
+	if fileContent != nil {
+		return fileContent.GetContent()
+	}
+
+	return "", err
 }
 
 // 从 kube yaml 中获取所有当前 containers 镜像和名称
@@ -303,7 +544,7 @@ func (m MatchFolders) ContainsFile(file string) bool {
 	return false
 }
 
-func MatchChanges(m commonmodels.MainHookRepo, files []string) bool {
+func MatchChanges(m *commonmodels.MainHookRepo, files []string) bool {
 	mf := MatchFolders(m.MatchFolders)
 	for _, file := range files {
 		if matches := mf.ContainsFile(file); matches {
@@ -313,7 +554,7 @@ func MatchChanges(m commonmodels.MainHookRepo, files []string) bool {
 	return false
 }
 
-func EventConfigured(m commonmodels.MainHookRepo, event config.HookEventType) bool {
+func EventConfigured(m *commonmodels.MainHookRepo, event config.HookEventType) bool {
 	for _, ev := range m.Events {
 		if ev == event {
 			return true
@@ -321,4 +562,146 @@ func EventConfigured(m commonmodels.MainHookRepo, event config.HookEventType) bo
 	}
 
 	return false
+}
+
+func ServicesMatchChangesFiles(mf *MatchFoldersElem, files []string) []BuildServices {
+	resMactchSvr := []BuildServices{}
+	var wg sync.WaitGroup
+	var mutex sync.Mutex
+	for _, mftreeElem := range mf.MatchFoldersTree {
+		wg.Add(1)
+		go func(mftree *MatchFoldersTree) {
+			defer wg.Done()
+			mf := MatchFolders(mftree.FileTree)
+			for _, file := range files {
+				if matches := mf.ContainsFile(file); matches {
+					mutex.Lock()
+					resMactchSvr = append(resMactchSvr, BuildServices{Name: mftree.Name, ServiceModule: mftree.ServiceModule})
+					mutex.Unlock()
+					break
+				}
+			}
+		}(mftreeElem)
+	}
+	wg.Wait()
+	return resMactchSvr
+}
+
+func getServiceTypeByProject(productName string) (string, error) {
+	projectInfo, err := templaterepo.NewProductColl().Find(productName)
+	if err != nil {
+		return "", err
+	}
+	projectType := setting.K8SDeployType
+	if projectInfo == nil || projectInfo.ProductFeature == nil {
+		return projectType, nil
+	} else if projectInfo.ProductFeature.BasicFacility == setting.BasicFacilityK8S {
+		if projectInfo.ProductFeature.DeployType == setting.HelmDeployType {
+			return setting.HelmDeployType, nil
+		}
+		return projectType, nil
+	} else if projectInfo.ProductFeature.BasicFacility == setting.BasicFacilityCVM {
+		return setting.PMDeployType, nil
+	}
+	return projectType, nil
+}
+
+func existStage(expectStage Stage, triggerYaml *TriggerYaml) bool {
+	for _, stage := range triggerYaml.Stages {
+		if stage == expectStage {
+			return true
+		}
+	}
+	return false
+}
+
+func checkTriggerYamlParams(triggerYaml *TriggerYaml) error {
+	//check stages
+	for _, stage := range triggerYaml.Stages {
+		if stage != StageBuild && stage != StageDeploy && stage != StageTest {
+			return fmt.Errorf("stages must %s or %s or %s", StageBuild, StageDeploy, StageTest)
+		}
+	}
+
+	//check build
+	if len(triggerYaml.Build) == 0 {
+		return errors.New("build is empty")
+	}
+	for _, bd := range triggerYaml.Build {
+		if bd.Name == "" || bd.ServiceModule == "" {
+			return errors.New("build.name or build.service_module is empty")
+		}
+	}
+
+	//check deploy
+	if triggerYaml.Deploy == nil {
+		return errors.New("deploy is empty")
+	}
+	if len(triggerYaml.Deploy.Envsname) == 0 {
+		return errors.New("deploy.envs_name is empty")
+	}
+	if triggerYaml.Deploy.Strategy != DeployStrategySingle && triggerYaml.Deploy.Strategy != DeployStrategyBase && triggerYaml.Deploy.Strategy != DeployStrategyDynamic {
+		return fmt.Errorf("deploy.strategy must %s or %s or %s", DeployStrategySingle, DeployStrategyDynamic, DeployStrategyBase)
+	}
+	if triggerYaml.Deploy.Strategy == DeployStrategyBase {
+		if triggerYaml.Deploy.BaseNamespace == "" {
+			return errors.New("deploy.base_env is empty")
+		}
+		if triggerYaml.Deploy.EnvRecyclePolicy != EnvRecyclePolicySuccess && triggerYaml.Deploy.EnvRecyclePolicy != EnvRecyclePolicyAlways && triggerYaml.Deploy.EnvRecyclePolicy != EnvRecyclePolicyNever {
+			return errors.New("deploy.env_recycle_policy must success/always/never")
+		}
+	} else {
+		if triggerYaml.Deploy.BaseNamespace != "" {
+			return errors.New("deploy.base_env must empty")
+		}
+	}
+
+	//check test
+	if existStage(StageTest, triggerYaml) {
+		if len(triggerYaml.Test) == 0 {
+			return errors.New("test is empty")
+		}
+		for _, tt := range triggerYaml.Test {
+			if tt.Repo == nil {
+				return errors.New("test.repo.strategy must default/currentRepo")
+			}
+			if tt.Repo.Strategy != TestRepoStrategyDefault && tt.Repo.Strategy != TestRepoStrategyCurrentRepo {
+				return errors.New("test.repo.strategy must default/currentRepo")
+			}
+		}
+	}
+
+	//check rule
+	if triggerYaml.Rules == nil {
+		return errors.New("rules must exist")
+	}
+	if len(triggerYaml.Rules.Branchs) == 0 {
+		return errors.New("rules.branchs must exist")
+	}
+	for _, ev := range triggerYaml.Rules.Events {
+		if ev != "pull_request" && ev != "push" && ev != "tag" {
+			return errors.New("rules.event must be pull_request or push or tag")
+		}
+	}
+	if triggerYaml.Rules.MatchFolders == nil {
+		return errors.New("rules.match_folders must exist")
+	}
+	for _, mf := range triggerYaml.Rules.MatchFolders.MatchFoldersTree {
+		if mf.Name == "" || mf.ServiceModule == "" {
+			return errors.New("match_folders.match_folders_tree.name or match_folders.match_folders_tree.service_module is empty")
+		}
+		if len(mf.FileTree) == 0 {
+			return errors.New("match_folders.match_folders_tree.file_tree is empty")
+		}
+	}
+
+	return nil
+}
+
+func getServiceSrcPath(service *commonmodels.Service) (string, error) {
+	if service.LoadPath != "" {
+		return service.LoadPath, nil
+	}
+	_, _, _, _, p, _, err := GetOwnerRepoBranchPath(service.SrcPath)
+	return p, err
 }

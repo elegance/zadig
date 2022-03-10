@@ -31,18 +31,9 @@ type PrivateKey struct {
 	CreateTime int64              `bson:"create_time"            json:"create_time"`
 	UpdateTime int64              `bson:"update_time"            json:"update_time"`
 	UpdateBy   string             `bson:"update_by"              json:"update_by"`
+	Provider   int8               `bson:"provider"               json:"provider"`
 }
 
 func (PrivateKey) TableName() string {
 	return "private_key"
 }
-
-//type SSH struct {
-//	ID         string `json:"id"`
-//	Name       string `json:"name"`
-//	UserName   string `json:"user_name"`
-//	IP         string `json:"ip"`
-//	IsProd     bool   `json:"is_prod"`
-//	Label      string `json:"label"`
-//	PrivateKey string `json:"private_key"`
-//}

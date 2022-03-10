@@ -27,6 +27,22 @@ import (
 	e "github.com/koderover/zadig/pkg/tool/errors"
 )
 
+type CheckJenkinsIntegrationResp struct {
+	Exists bool `json:"exists"`
+}
+
+func CheckJenkinsIntegration(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	resp, err := service.ListJenkinsIntegration(ctx.Logger)
+	if err != nil || len(resp) == 0 {
+		ctx.Resp = &CheckJenkinsIntegrationResp{Exists: false}
+		return
+	}
+	ctx.Resp = &CheckJenkinsIntegrationResp{Exists: true}
+}
+
 func CreateJenkinsIntegration(c *gin.Context) {
 	ctx := internalhandler.NewContext(c)
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
@@ -36,7 +52,7 @@ func CreateJenkinsIntegration(c *gin.Context) {
 		ctx.Err = e.ErrInvalidParam.AddDesc("invalid jenkinsIntegration json args")
 		return
 	}
-	args.UpdateBy = ctx.Username
+	args.UpdateBy = ctx.UserName
 	if _, err := url.Parse(args.URL); err != nil {
 		ctx.Err = e.ErrInvalidParam.AddDesc("invalid url")
 		return
@@ -60,7 +76,7 @@ func UpdateJenkinsIntegration(c *gin.Context) {
 		ctx.Err = e.ErrInvalidParam.AddDesc("invalid jenkinsIntegration json args")
 		return
 	}
-	args.UpdateBy = ctx.Username
+	args.UpdateBy = ctx.UserName
 	ctx.Err = service.UpdateJenkinsIntegration(c.Param("id"), args, ctx.Logger)
 }
 

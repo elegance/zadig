@@ -28,6 +28,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/koderover/zadig/pkg/microservice/warpdrive/config"
+	"github.com/koderover/zadig/pkg/microservice/warpdrive/core/service/common"
 	plugins "github.com/koderover/zadig/pkg/microservice/warpdrive/core/service/taskplugin"
 	"github.com/koderover/zadig/pkg/microservice/warpdrive/core/service/types"
 	"github.com/koderover/zadig/pkg/microservice/warpdrive/core/service/types/task"
@@ -45,7 +46,6 @@ var (
 	xl           *zap.SugaredLogger
 )
 
-// ExecHandler ...
 // Sender: sender to send ack/notification
 // TaskPlugins: registered task plugin initiators to initiate specific plugin to execute task
 type ExecHandler struct {
@@ -53,10 +53,8 @@ type ExecHandler struct {
 	TaskPlugins map[config.TaskType]plugins.Initiator
 }
 
-// CancelHandler ...
 type CancelHandler struct{}
 
-// HandleMessage ...
 // Message handler to handle task execution message
 func (h *ExecHandler) HandleMessage(message *nsq.Message) error {
 	defer func() {
@@ -184,6 +182,7 @@ func (h *CancelHandler) HandleMessage(message *nsq.Message) error {
 	if pipelineTask != nil && pipelineTask.PipelineName == msg.PipelineName && pipelineTask.TaskID == msg.TaskID {
 		xl.Infof("cancelling message: %+v", msg)
 		pipelineTask.TaskRevoker = msg.Revoker
+
 		//取消pipelineTask
 		cancel()
 		//xl.Debug("no matched pipeline task found on this warpdrive")
@@ -250,6 +249,7 @@ func (h *ExecHandler) SendNotification() {
 			Status:       config.Status(pipelineTask.Status),
 			TeamName:     pipelineTask.TeamName,
 			Type:         pipelineTask.Type,
+			Stages:       pipelineTask.Stages,
 		},
 		CreateTime: time.Now().Unix(),
 		IsRead:     false,
@@ -267,7 +267,7 @@ func (h *ExecHandler) SendNotification() {
 	}
 }
 
-func (h *ExecHandler) runStage(stagePosition int, stage *task.Stage) {
+func (h *ExecHandler) runStage(stagePosition int, stage *common.Stage, concurrency int64) {
 	xl.Infof("start to execute pipeline stage: %s at position: %d", stage.TaskType, stagePosition)
 	pluginInitiator, ok := h.TaskPlugins[stage.TaskType]
 	if !ok {
@@ -284,9 +284,8 @@ func (h *ExecHandler) runStage(stagePosition int, stage *task.Stage) {
 	// Default worker concurrency is 1, run tasks sequentially
 	var workerConcurrency = 1
 	if runParallel {
-		// MaxWorkerInParallel is 5 for now
-		if len(stage.SubTasks) > maxWorkerInParallel {
-			workerConcurrency = maxWorkerInParallel
+		if len(stage.SubTasks) > int(concurrency) {
+			workerConcurrency = int(concurrency)
 		} else {
 			workerConcurrency = len(stage.SubTasks)
 		}
@@ -336,7 +335,7 @@ func (h *ExecHandler) runStage(stagePosition int, stage *task.Stage) {
 func (h *ExecHandler) execute(ctx context.Context, pipelineTask *task.Task, pipelineCtx *task.PipelineCtx, xl *zap.SugaredLogger) {
 	xl.Info("start pipeline task executor...")
 	// 如果是pipeline 1.0， 先将subtasks进行transform，转化为stages结构
-	if pipelineTask.Type == config.SingleType || pipelineTask.Type == "" {
+	if pipelineTask.Type == config.SingleType || pipelineTask.Type == "" || pipelineTask.Type == config.WorkflowTypeV3 {
 		err := transformToStages(pipelineTask, xl)
 		// 初始化出错时，直接返回pipeline状态错误
 		if err != nil {
@@ -349,7 +348,7 @@ func (h *ExecHandler) execute(ctx context.Context, pipelineTask *task.Task, pipe
 	// Stage之间仅支持串行
 	for stagePosition, stage := range pipelineTask.Stages {
 		if !stage.AfterAll {
-			h.runStage(stagePosition, stage)
+			h.runStage(stagePosition, stage, pipelineTask.ConfigPayload.BuildConcurrency)
 			// 如果一个Stage执行失败了，跳出执行循环，并且更新pipelinetask状态为失败，发送ACK，并返回
 			if stage.Status == config.StatusFailed || stage.Status == config.StatusCancelled || stage.Status == config.StatusTimeout {
 				break
@@ -357,9 +356,30 @@ func (h *ExecHandler) execute(ctx context.Context, pipelineTask *task.Task, pipe
 		}
 	}
 
+	updatePipelineStatus(pipelineTask, xl)
+	deployStageStatus := config.StatusInit
+	testStageStatus := config.StatusInit
 	for stagePosition, stage := range pipelineTask.Stages {
+		if stage.TaskType == config.TaskDeploy || stage.TaskType == config.TaskArtifact {
+			deployStageStatus = stage.Status
+		} else if stage.TaskType == config.TaskTestingV2 {
+			testStageStatus = stage.Status
+		}
 		if stage.AfterAll {
-			h.runStage(stagePosition, stage)
+			if stage.TaskType == config.TaskResetImage {
+				switch pipelineTask.ResetImagePolicy {
+				case setting.ResetImagePolicyTaskCompleted, setting.ResetImagePolicyTaskCompletedOrder:
+				case setting.ResetImagePolicyDeployFailed:
+					if deployStageStatus == config.StatusInit || (deployStageStatus != config.StatusFailed && deployStageStatus != config.StatusCancelled && deployStageStatus != config.StatusTimeout) {
+						continue
+					}
+				case setting.ResetImagePolicyTestFailed:
+					if testStageStatus == config.StatusInit || (testStageStatus != config.StatusFailed && testStageStatus != config.StatusCancelled && testStageStatus != config.StatusTimeout) {
+						continue
+					}
+				}
+			}
+			h.runStage(stagePosition, stage, pipelineTask.ConfigPayload.BuildConcurrency)
 		}
 	}
 
@@ -410,6 +430,12 @@ func (h *ExecHandler) executeTask(taskCtx context.Context, plugin plugins.TaskPl
 	} else if pipelineTask.Type == config.ServiceType {
 		fileName = strings.Replace(strings.ToLower(fmt.Sprintf("%s-%s-%d-%s-%s", config.ServiceType, pipelineTask.PipelineName, pipelineTask.TaskID, plugin.Type(), servicename)),
 			"_", "-", -1)
+	} else if pipelineTask.Type == config.WorkflowTypeV3 {
+		fileName = strings.Replace(strings.ToLower(fmt.Sprintf("%s-%s-%d-%s-%s", config.WorkflowTypeV3, pipelineTask.PipelineName, pipelineTask.TaskID, plugin.Type(), fmt.Sprintf("%s-job", pipelineTask.PipelineName))),
+			"_", "-", -1)
+	} else if pipelineTask.Type == config.ArtifactType {
+		fileName = strings.Replace(strings.ToLower(fmt.Sprintf("%s-%s-%d-%s", config.ArtifactType, pipelineTask.PipelineName, pipelineTask.TaskID, plugin.Type())),
+			"_", "-", -1)
 	}
 	plugin.Init(jobName, fileName, xl)
 
@@ -434,7 +460,12 @@ func (h *ExecHandler) executeTask(taskCtx context.Context, plugin plugins.TaskPl
 	}
 
 	// 设置 SubTask 初始状态
-	plugin.SetStatus(config.StatusRunning)
+	switch plugin.Type() {
+	case config.TaskBuild, config.TaskTestingV2:
+		plugin.SetStatus(config.StatusPrepare)
+	default:
+		plugin.SetStatus(config.StatusRunning)
+	}
 
 	// 设置 SubTask 开始时间
 	plugin.SetStartTime()
@@ -453,7 +484,7 @@ func (h *ExecHandler) executeTask(taskCtx context.Context, plugin plugins.TaskPl
 	xl.Info("start to call plugin.Run")
 	// 如果是并行跑，用servicename来区分不同的workspace
 	runCtx := *pipelineCtx
-	if pipelineTask.Type == config.WorkflowType {
+	if pipelineTask.Type == config.WorkflowType || pipelineTask.Type == config.WorkflowTypeV3 {
 		runCtx.Workspace = fmt.Sprintf("%s/%s", pipelineCtx.Workspace, servicename)
 	}
 	// 运行 SubTask, 如果需要异步，请在方法内实现
@@ -495,7 +526,6 @@ func (h *ExecHandler) executeTask(taskCtx context.Context, plugin plugins.TaskPl
 }
 
 func Logger(pipelineTask *task.Task) *zap.SugaredLogger {
-	// 初始化Logger
 	l := log.Logger()
 	if pipelineTask != nil {
 		l.With(zap.String(setting.RequestID, pipelineTask.ReqID))

@@ -25,10 +25,12 @@ import (
 
 	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
+	commonmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models/task"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/nsq"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/scmnotify"
+	"github.com/koderover/zadig/pkg/setting"
 	e "github.com/koderover/zadig/pkg/tool/errors"
 )
 
@@ -37,6 +39,14 @@ type cancelMessage struct {
 	PipelineName string `json:"pipeline_name"`
 	TaskID       int64  `json:"task_id"`
 	ReqID        string `json:"req_id"`
+}
+
+func CancelWorkflowTaskV3(userName, pipelineName string, taskID int64, typeString config.PipelineType, requestID string, log *zap.SugaredLogger) error {
+	if err := CancelTask(userName, pipelineName, taskID, typeString, requestID, log); err != nil {
+		log.Errorf("[%s] cancel pipeline [%s:%d] error: %s", userName, pipelineName, taskID, err)
+		return e.ErrCancelTask.AddDesc(err.Error())
+	}
+	return nil
 }
 
 func CancelTaskV2(userName, pipelineName string, taskID int64, typeString config.PipelineType, requestID string, log *zap.SugaredLogger) error {
@@ -73,7 +83,6 @@ func CancelTask(userName, pipelineName string, taskID int64, typeString config.P
 
 			if typeString == config.WorkflowType {
 				_ = scmNotifyService.UpdateWebhookComment(t, log)
-				_ = scmNotifyService.UpdateDiffNote(t, log)
 			} else if typeString == config.TestType {
 				_ = scmNotifyService.UpdateWebhookCommentForTest(t, log)
 			} else if typeString == config.SingleType {
@@ -114,14 +123,13 @@ func CancelTask(userName, pipelineName string, taskID int64, typeString config.P
 	q := covertTaskToQueue(t)
 	Remove(q, log)
 
-	if err := nsq.Publish(config.TopicCancel, b); err != nil {
+	if err := nsq.Publish(setting.TopicCancel, b); err != nil {
 		log.Errorf("[%s] cancel %s %s:%d error", userName, t.AgentHost, pipelineName, taskID)
 		return err
 	}
 
 	if typeString == config.WorkflowType {
 		_ = scmNotifyService.UpdateWebhookComment(t, log)
-		_ = scmNotifyService.UpdateDiffNote(t, log)
 	} else if typeString == config.TestType {
 		_ = scmNotifyService.UpdateWebhookCommentForTest(t, log)
 	} else if typeString == config.SingleType {
@@ -161,4 +169,11 @@ func covertTaskToQueue(t *task.Task) *models.Queue {
 		Type:         t.Type,
 		CreateTime:   t.CreateTime,
 	}
+}
+
+func GetWorkflowTaskCallback(taskID int64, pipelineName string) (*commonmodels.CallbackRequest, error) {
+	return mongodb.NewCallbackRequestColl().Find(&mongodb.CallbackFindOption{
+		TaskID:       taskID,
+		PipelineName: pipelineName,
+	})
 }

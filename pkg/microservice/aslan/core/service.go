@@ -26,15 +26,23 @@ import (
 
 	commonconfig "github.com/koderover/zadig/pkg/config"
 	"github.com/koderover/zadig/pkg/microservice/aslan/config"
+	modeMongodb "github.com/koderover/zadig/pkg/microservice/aslan/core/collaboration/repository/mongodb"
 	commonrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb/template"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/nsq"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/webhook"
+	deliveryhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/delivery/handler"
+	environmenthandler "github.com/koderover/zadig/pkg/microservice/aslan/core/environment/handler"
 	environmentservice "github.com/koderover/zadig/pkg/microservice/aslan/core/environment/service"
+	labelMongodb "github.com/koderover/zadig/pkg/microservice/aslan/core/label/repository/mongodb"
+	projecthandler "github.com/koderover/zadig/pkg/microservice/aslan/core/project/handler"
+	systemrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/system/repository/mongodb"
 	systemservice "github.com/koderover/zadig/pkg/microservice/aslan/core/system/service"
-	webhookservice "github.com/koderover/zadig/pkg/microservice/aslan/core/workflow/service/webhook"
+	workflowhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/workflow/handler"
 	workflowservice "github.com/koderover/zadig/pkg/microservice/aslan/core/workflow/service/workflow"
+	testinghandler "github.com/koderover/zadig/pkg/microservice/aslan/core/workflow/testing/handler"
 	"github.com/koderover/zadig/pkg/setting"
+	"github.com/koderover/zadig/pkg/shared/client/policy"
 	"github.com/koderover/zadig/pkg/tool/log"
 	mongotool "github.com/koderover/zadig/pkg/tool/mongo"
 )
@@ -42,6 +50,10 @@ import (
 const (
 	webhookController = iota
 )
+
+type policyGetter interface {
+	Policies() []*policy.PolicyMeta
+}
 
 type Controller interface {
 	Run(workers int, stopCh <-chan struct{})
@@ -67,6 +79,28 @@ func StartControllers(stopCh <-chan struct{}) {
 	wg.Wait()
 }
 
+func registerPolicies() {
+	policyClient := policy.NewWithRetry()
+	var policies []*policy.PolicyMeta
+	for _, r := range []policyGetter{
+		new(workflowhandler.Router),
+		new(environmenthandler.Router),
+		new(projecthandler.Router),
+		new(testinghandler.Router),
+		new(deliveryhandler.Router),
+	} {
+		policies = append(policies, r.Policies()...)
+	}
+
+	for _, p := range policies {
+		err := policyClient.CreateOrUpdatePolicyRegistration(p)
+		if err != nil {
+			// should not have happened here
+			log.DPanic(err)
+		}
+	}
+}
+
 func Start(ctx context.Context) {
 	log.Init(&log.Config{
 		Level:       commonconfig.LogLevel(),
@@ -87,10 +121,9 @@ func Start(ctx context.Context) {
 
 	environmentservice.ResetProductsStatus()
 
-	go StartControllers(ctx.Done())
+	registerPolicies()
 
-	// 仅用于升级 release v1.2.1, 将在下一版本移除
-	webhookservice.SyncWebHooks()
+	go StartControllers(ctx.Done())
 }
 
 func Stop(ctx context.Context) {
@@ -131,7 +164,7 @@ func initDatabase() {
 		template.NewProductColl(),
 		commonrepo.NewBasicImageColl(),
 		commonrepo.NewBuildColl(),
-		commonrepo.NewConfigColl(),
+		commonrepo.NewCallbackRequestColl(),
 		commonrepo.NewCounterColl(),
 		commonrepo.NewCronjobColl(),
 		commonrepo.NewDeliveryActivityColl(),
@@ -164,6 +197,7 @@ func initDatabase() {
 		commonrepo.NewStrategyColl(),
 		commonrepo.NewStatsColl(),
 		commonrepo.NewSubscriptionColl(),
+		commonrepo.NewSystemSettingColl(),
 		commonrepo.NewTaskColl(),
 		commonrepo.NewTestTaskStatColl(),
 		commonrepo.NewTestingColl(),
@@ -171,6 +205,19 @@ func initDatabase() {
 		commonrepo.NewWebHookUserColl(),
 		commonrepo.NewWorkflowColl(),
 		commonrepo.NewWorkflowStatColl(),
+		commonrepo.NewWorkLoadsStatColl(),
+		commonrepo.NewServicesInExternalEnvColl(),
+		commonrepo.NewExternalLinkColl(),
+		commonrepo.NewChartColl(),
+		commonrepo.NewDockerfileTemplateColl(),
+		commonrepo.NewProjectClusterRelationColl(),
+
+		systemrepo.NewAnnouncementColl(),
+		systemrepo.NewOperationLogColl(),
+		labelMongodb.NewLabelColl(),
+		labelMongodb.NewLabelBindingColl(),
+		modeMongodb.NewCollaborationModeColl(),
+		modeMongodb.NewCollaborationInstanceColl(),
 	} {
 		wg.Add(1)
 		go func(r indexer) {
@@ -186,6 +233,11 @@ func initDatabase() {
 	// 初始化数据
 	commonrepo.NewInstallColl().InitInstallData(systemservice.InitInstallMap())
 	commonrepo.NewBasicImageColl().InitBasicImageData(systemservice.InitbasicImageInfos())
+	commonrepo.NewSystemSettingColl().InitSystemSettings()
+
+	if err := commonrepo.NewS3StorageColl().InitData(); err != nil {
+		log.Warnf("Failed to init S3 data: %s", err)
+	}
 }
 
 type indexer interface {

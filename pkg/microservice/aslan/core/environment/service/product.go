@@ -29,9 +29,9 @@ import (
 	commonrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
 	templaterepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb/template"
 	commonservice "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service"
+	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/collaboration"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/kube"
 	"github.com/koderover/zadig/pkg/setting"
-	"github.com/koderover/zadig/pkg/shared/poetry"
 	e "github.com/koderover/zadig/pkg/tool/errors"
 	"github.com/koderover/zadig/pkg/tool/log"
 )
@@ -48,7 +48,10 @@ func CleanProductCronJob(requestID string, log *zap.SugaredLogger) {
 		log.Errorf("[Product.List] error: %v", err)
 		return
 	}
-
+	envCMMap, err := collaboration.GetEnvCMMap([]string{}, log)
+	if err != nil {
+		return
+	}
 	wl := sets.NewString(DefaultCleanWhiteList...)
 	wl.Insert(config.CleanSkippedList()...)
 	for _, product := range products {
@@ -59,25 +62,21 @@ func CleanProductCronJob(requestID string, log *zap.SugaredLogger) {
 		if product.RecycleDay == 0 {
 			continue
 		}
-
+		if _, ok := envCMMap[collaboration.BuildEnvCMMapKey(product.ProductName, product.EnvName)]; ok {
+			continue
+		}
 		if time.Now().Unix()-product.UpdateTime > int64(60*60*24*product.RecycleDay) {
-			title := "系统清理产品信息"
-			content := fmt.Sprintf("环境 [%s] 已经连续%d天没有使用, 系统已自动删除该环境, 如有需要请重新创建。", product.EnvName, product.RecycleDay)
+			//title := "系统清理产品信息"
+			//content := fmt.Sprintf("环境 [%s] 已经连续%d天没有使用, 系统已自动删除该环境, 如有需要请重新创建。", product.EnvName, product.RecycleDay)
 
 			if err := commonservice.DeleteProduct("robot", product.EnvName, product.ProductName, requestID, log); err != nil {
 				log.Errorf("[%s][P:%s] delete product error: %v", product.EnvName, product.ProductName, err)
 
 				// 如果有错误，重试删除
 				if err := commonservice.DeleteProduct("robot", product.EnvName, product.ProductName, requestID, log); err != nil {
-					content = fmt.Sprintf("系统自动清理环境 [%s] 失败，请手动删除环境。", product.ProductName)
+					//content = fmt.Sprintf("系统自动清理环境 [%s] 失败，请手动删除环境。", product.ProductName)
 					log.Errorf("[%s][P:%s] retry delete product error: %v", product.EnvName, product.ProductName, err)
 				}
-			}
-
-			poetryClient := poetry.New(config.PoetryAPIServer(), config.PoetryAPIRootKey())
-			users, _ := poetryClient.ListProductPermissionUsers("", "", log)
-			for _, user := range users {
-				commonservice.SendMessage(user, title, content, requestID, log)
 			}
 
 			log.Warnf("[%s] product %s deleted", product.EnvName, product.ProductName)
@@ -94,7 +93,6 @@ func GetInitProduct(productTmplName string, log *zap.SugaredLogger) (*commonmode
 		log.Error(errMsg)
 		return nil, e.ErrGetProduct.AddDesc(errMsg)
 	}
-
 	if prodTmpl.ProductFeature == nil || prodTmpl.ProductFeature.DeployType == setting.K8SDeployType {
 		err = commonservice.FillProductTemplateVars([]*templatemodels.Product{prodTmpl}, log)
 	} else if prodTmpl.ProductFeature.DeployType == setting.HelmDeployType {
@@ -109,57 +107,52 @@ func GetInitProduct(productTmplName string, log *zap.SugaredLogger) (*commonmode
 	//返回中的ProductName即产品模板的名称
 	ret.ProductName = prodTmpl.ProductName
 	ret.Revision = prodTmpl.Revision
-	ret.Enabled = prodTmpl.Enabled
 	ret.Services = [][]*commonmodels.ProductService{}
 	ret.UpdateBy = prodTmpl.UpdateBy
 	ret.CreateTime = prodTmpl.CreateTime
-	ret.Visibility = prodTmpl.Visibility
 	ret.Render = &commonmodels.RenderInfo{Name: "", Description: ""}
 	ret.Vars = prodTmpl.Vars
 	ret.ChartInfos = prodTmpl.ChartInfos
+	if prodTmpl.ProductFeature != nil && prodTmpl.ProductFeature.BasicFacility == setting.BasicFacilityCVM {
+		ret.Source = setting.PMDeployType
+	}
 
+	allServiceInfoMap := prodTmpl.AllServiceInfoMap()
 	for _, names := range prodTmpl.Services {
 		servicesResp := make([]*commonmodels.ProductService, 0)
 
 		for _, serviceName := range names {
 			opt := &commonrepo.ServiceFindOption{
 				ServiceName:   serviceName,
+				ProductName:   allServiceInfoMap[serviceName].Owner,
 				ExcludeStatus: setting.ProductStatusDeleting,
 			}
 
-			serviceTmpls, err := commonrepo.NewServiceColl().List(opt)
+			serviceTmpl, err := commonrepo.NewServiceColl().Find(opt)
 			if err != nil {
-				errMsg := fmt.Sprintf("[ServiceTmpl.List] %s error: %v", opt.ServiceName, err)
+				errMsg := fmt.Sprintf("Can not find service with option %+v, error: %v", opt, err)
 				log.Error(errMsg)
 				return nil, e.ErrGetProduct.AddDesc(errMsg)
 			}
-			for _, serviceTmpl := range serviceTmpls {
-				serviceResp := &commonmodels.ProductService{
-					ServiceName: serviceTmpl.ServiceName,
-					Type:        serviceTmpl.Type,
-					Revision:    serviceTmpl.Revision,
-				}
-				if serviceTmpl.Type == setting.K8SDeployType {
-					serviceResp.Containers = make([]*commonmodels.Container, 0)
-					for _, c := range serviceTmpl.Containers {
-						container := &commonmodels.Container{
-							Name:  c.Name,
-							Image: c.Image,
-						}
-						serviceResp.Containers = append(serviceResp.Containers, container)
-					}
-				} else if serviceTmpl.Type == setting.HelmDeployType {
-					serviceResp.Containers = make([]*commonmodels.Container, 0)
-					for _, c := range serviceTmpl.Containers {
-						container := &commonmodels.Container{
-							Name:  c.Name,
-							Image: c.Image,
-						}
-						serviceResp.Containers = append(serviceResp.Containers, container)
-					}
-				}
-				servicesResp = append(servicesResp, serviceResp)
+
+			serviceResp := &commonmodels.ProductService{
+				ServiceName: serviceTmpl.ServiceName,
+				ProductName: serviceTmpl.ProductName,
+				Type:        serviceTmpl.Type,
+				Revision:    serviceTmpl.Revision,
 			}
+			if serviceTmpl.Type == setting.K8SDeployType || serviceTmpl.Type == setting.HelmDeployType {
+				serviceResp.Containers = make([]*commonmodels.Container, 0)
+				for _, c := range serviceTmpl.Containers {
+					container := &commonmodels.Container{
+						Name:      c.Name,
+						Image:     c.Image,
+						ImagePath: c.ImagePath,
+					}
+					serviceResp.Containers = append(serviceResp.Containers, container)
+				}
+			}
+			servicesResp = append(servicesResp, serviceResp)
 		}
 		ret.Services = append(ret.Services, servicesResp)
 	}
@@ -168,11 +161,10 @@ func GetInitProduct(productTmplName string, log *zap.SugaredLogger) (*commonmode
 }
 
 func GetProduct(username, envName, productName string, log *zap.SugaredLogger) (*ProductResp, error) {
-	log.Infof("[User:%s][EnvName:%s][Product:%s] GetProduct", username, envName, productName)
 	opt := &commonrepo.ProductFindOptions{Name: productName, EnvName: envName}
 	prod, err := commonrepo.NewProductColl().Find(opt)
 	if err != nil {
-		log.Errorf("[User:%s][EnvName:%s][Product:%s] Product.FindByOwner error: %v", username, envName, productName, err)
+		log.Errorf("[User:%s][EnvName:%s][Product:%s] Product.FindByOwner error: %s", username, envName, productName, err)
 		return nil, e.ErrGetEnv
 	}
 
@@ -183,6 +175,14 @@ func GetProduct(username, envName, productName string, log *zap.SugaredLogger) (
 		}
 	}
 
+	if len(prod.RegistryID) == 0 {
+		reg, _, err := commonservice.FindDefaultRegistry(false, log)
+		if err != nil {
+			log.Errorf("[User:%s][EnvName:%s][Product:%s] FindDefaultRegistry error: %s", username, envName, productName, err)
+			return nil, err
+		}
+		prod.RegistryID = reg.ID.Hex()
+	}
 	resp := buildProductResp(prod.EnvName, prod, log)
 	return resp, nil
 }
@@ -201,9 +201,11 @@ func buildProductResp(envName string, prod *commonmodels.Product, log *zap.Sugar
 		Error:       prod.Error,
 		Vars:        prod.Vars[:],
 		IsPublic:    prod.IsPublic,
+		IsExisted:   prod.IsExisted,
 		ClusterID:   prod.ClusterID,
 		RecycleDay:  prod.RecycleDay,
 		Source:      prod.Source,
+		RegisterID:  prod.RegistryID,
 	}
 
 	if prod.ClusterID != "" {
@@ -220,12 +222,16 @@ func buildProductResp(envName string, prod *commonmodels.Product, log *zap.Sugar
 			return prodResp
 		}
 		prodResp.IsProd = cluster.Production
+		prodResp.ClusterName = cluster.Name
+		prodResp.IsLocal = cluster.Local
 
-		if !clusterService.ClusterConnected(prod.ClusterID) {
+		if !prodResp.IsLocal && !clusterService.ClusterConnected(prod.ClusterID) {
 			prodResp.Status = setting.ClusterDisconnected
 			prodResp.Error = "集群未连接"
 			return prodResp
 		}
+	} else {
+		prodResp.IsLocal = true
 	}
 
 	if prod.Status == setting.ProductStatusCreating {
@@ -252,7 +258,7 @@ func buildProductResp(envName string, prod *commonmodels.Product, log *zap.Sugar
 
 	switch prod.Source {
 	case setting.SourceFromExternal, setting.SourceFromHelm:
-		servicesResp, _, errObj = commonservice.ListGroupsBySource(envName, prod.ProductName, log)
+		_, servicesResp, errObj = commonservice.ListWorkloadsInEnv(envName, prod.ProductName, "", 0, 0, log)
 		if len(servicesResp) == 0 && errObj == nil {
 			prodResp.Status = prod.Status
 			prodResp.Error = prod.Error
@@ -275,6 +281,7 @@ func buildProductResp(envName string, prod *commonmodels.Product, log *zap.Sugar
 			}
 		}
 
+		//TODO is it reasonable to ignore error when all pods are running？
 		if allRunning {
 			prodResp.Status = setting.PodRunning
 			prodResp.Error = ""

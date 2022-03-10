@@ -21,7 +21,8 @@ import (
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
 	"github.com/koderover/zadig/pkg/setting"
-	"github.com/koderover/zadig/pkg/shared/codehost"
+	"github.com/koderover/zadig/pkg/shared/client/systemconfig"
+	"github.com/koderover/zadig/pkg/tool/crypto"
 )
 
 func GetConfigPayload(codeHostID int) *models.ConfigPayload {
@@ -29,7 +30,7 @@ func GetConfigPayload(codeHostID int) *models.ConfigPayload {
 		S3Storage: models.S3Config{
 			Ak:       config.S3StorageAK(),
 			Sk:       config.S3StorageSK(),
-			Endpoint: config.S3StorageBucket(),
+			Endpoint: config.S3StorageEndpoint(),
 			Bucket:   config.S3StorageBucket(),
 			Path:     config.S3StoragePath(),
 			Protocol: config.S3StorageProtocol(),
@@ -54,6 +55,7 @@ func GetConfigPayload(codeHostID int) *models.ConfigPayload {
 			ReaperImage:      config.ReaperImage(),
 			ReaperBinaryFile: config.ReaperBinaryFile(),
 			PredatorImage:    config.PredatorImage(),
+			PackagerImage:    config.PackagerImage(),
 		},
 		Docker: models.DockerConfig{
 			HostList: config.DockerHosts(),
@@ -64,6 +66,8 @@ func GetConfigPayload(codeHostID int) *models.ConfigPayload {
 		JenkinsBuildConfig: models.JenkinsBuildConfig{
 			JenkinsBuildImage: config.JenkinsImage(),
 		},
+		AesKey:           crypto.GetAesKey(),
+		BuildConcurrency: 5,
 	}
 
 	githubApps, _ := mongodb.NewGithubAppColl().Find()
@@ -73,7 +77,7 @@ func GetConfigPayload(codeHostID int) *models.ConfigPayload {
 	}
 
 	if codeHostID > 0 {
-		ch, _ := codehost.GetCodeHostInfoByID(codeHostID)
+		ch, _ := systemconfig.New().GetCodeHost(codeHostID)
 		if ch != nil && ch.Type == setting.SourceFromGithub {
 			payload.Github.AccessToken = ch.AccessToken
 		}
@@ -84,10 +88,40 @@ func GetConfigPayload(codeHostID int) *models.ConfigPayload {
 		payload.Proxy = *proxies[0]
 	}
 
+	concurrencySettings, _ := mongodb.NewSystemSettingColl().Get()
+	if concurrencySettings != nil {
+		payload.BuildConcurrency = concurrencySettings.BuildConcurrency
+	}
+
 	privateKeys, _ := mongodb.NewPrivateKeyColl().List(&mongodb.PrivateKeyArgs{})
 	if len(privateKeys) != 0 {
 		payload.PrivateKeys = privateKeys
 	}
 
+	k8sClusters, _ := mongodb.NewK8SClusterColl().List(nil)
+	if len(k8sClusters) != 0 {
+		var K8SClusterResp []*models.K8SClusterResp
+		for _, k8sCluster := range k8sClusters {
+			K8SClusterResp = append(K8SClusterResp, &models.K8SClusterResp{
+				ID:             k8sCluster.ID.Hex(),
+				Name:           k8sCluster.Name,
+				AdvancedConfig: k8sCluster.AdvancedConfig,
+			})
+		}
+		payload.K8SClusters = K8SClusterResp
+	}
+
+	objectStorage, _ := mongodb.NewS3StorageColl().FindDefault()
+	if objectStorage != nil {
+		payload.S3Storage.Endpoint = objectStorage.Endpoint
+		payload.S3Storage.Sk = objectStorage.Sk
+		payload.S3Storage.Ak = objectStorage.Ak
+		payload.S3Storage.Path = objectStorage.Subfolder
+		payload.S3Storage.Bucket = objectStorage.Bucket
+		payload.S3Storage.Protocol = "https"
+		if objectStorage.Insecure {
+			payload.S3Storage.Protocol = "http"
+		}
+	}
 	return payload
 }

@@ -50,6 +50,10 @@ type Product struct {
 	RecycleDay   int                           `bson:"recycle_day"               json:"recycle_day"`
 	Source       string                        `bson:"source"                    json:"source"`
 	IsOpenSource bool                          `bson:"is_opensource"             json:"is_opensource"`
+	RegistryID   string                        `bson:"registry_id"               json:"registry_id"`
+	BaseName     string                        `bson:"base_name" json:"base_name"`
+	// IsExisted is true if this environment is created from an existing one
+	IsExisted bool `bson:"is_existed"                json:"is_existed"`
 	// TODO: temp flag
 	IsForkedProduct bool `bson:"-" json:"-"`
 }
@@ -68,13 +72,13 @@ type ProductAuth struct {
 }
 
 type ProductService struct {
-	ServiceName string           `bson:"service_name"               json:"service_name"`
-	Type        string           `bson:"type"                       json:"type"`
-	Revision    int64            `bson:"revision"                   json:"revision"`
-	Containers  []*Container     `bson:"containers"                 json:"containers,omitempty"`
-	Configs     []*ServiceConfig `bson:"configs,omitempty"          json:"configs,omitempty"`
-	Render      *RenderInfo      `bson:"render,omitempty"           json:"render,omitempty"` // 记录每个服务render信息 便于更新单个服务
-	EnvConfigs  []*EnvConfig     `bson:"-"                          json:"env_configs,omitempty"`
+	ServiceName string       `bson:"service_name"               json:"service_name"`
+	ProductName string       `bson:"product_name"               json:"product_name"`
+	Type        string       `bson:"type"                       json:"type"`
+	Revision    int64        `bson:"revision"                   json:"revision"`
+	Containers  []*Container `bson:"containers"                 json:"containers,omitempty"`
+	Render      *RenderInfo  `bson:"render,omitempty"           json:"render,omitempty"` // 记录每个服务render信息 便于更新单个服务
+	EnvConfigs  []*EnvConfig `bson:"-"                          json:"env_configs,omitempty"`
 }
 
 type ServiceConfig struct {
@@ -88,7 +92,6 @@ func (Product) TableName() string {
 
 // TODO: LOU: what namespace is it??
 func (p *Product) GetNamespace() string {
-	//return "koderover-" + p.EnvName + "-" + p.ProductName
 	return p.ProductName + "-env-" + p.EnvName
 }
 

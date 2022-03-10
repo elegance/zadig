@@ -26,9 +26,10 @@ import (
 )
 
 type Build struct {
-	TaskType   config.TaskType `bson:"type"                       json:"type"`
-	Enabled    bool            `bson:"enabled"                    json:"enabled"`
-	TaskStatus config.Status   `bson:"status"                     json:"status"`
+	TaskType    config.TaskType `bson:"type"                       json:"type"`
+	Enabled     bool            `bson:"enabled"                    json:"enabled"`
+	TaskStatus  config.Status   `bson:"status"                     json:"status"`
+	ProductName string          `bson:"product_name"               json:"product_name"`
 	// 新增一个service表示服务名称
 	Service string `bson:"service"                    json:"service"`
 	// 该名称实际为服务组件名称
@@ -47,6 +48,7 @@ type Build struct {
 	ImageFrom         string                      `bson:"image_from"                 json:"image_from,omitempty"`
 	ImageID           string                      `bson:"image_id"                   json:"image_id"`
 	ResReq            setting.Request             `bson:"res_req"                    json:"res_req"`
+	ResReqSpec        setting.RequestSpec         `bson:"res_req_spec"               json:"res_req_spec"`
 	LogFile           string                      `bson:"log_file"                   json:"log_file"`
 	InstallCtx        []*models.Install           `bson:"-"                          json:"install_ctx,omitempty"`
 	Registries        []*models.RegistryNamespace `bson:"-"                   json:"registries"`
@@ -55,6 +57,23 @@ type Build struct {
 	DockerBuildStatus *DockerBuildStatus          `bson:"docker_build_status,omitempty" json:"docker_build_status,omitempty"`
 	BuildStatus       *BuildStatus                `bson:"build_status,omitempty" json:"build_status,omitempty"`
 	IsRestart         bool                        `bson:"is_restart"                      json:"is_restart"`
+	// Get the host bound to the environment of the cloud host service configuration
+	EnvHostInfo  map[string][]string `bson:"env_host_info,omitempty"         json:"env_host_info,omitempty"`
+	ArtifactInfo *ArtifactInfo       `bson:"artifact_info,omitempty"         json:"artifact_info,omitempty"`
+	ClusterID    string              `bson:"cluster_id,omitempty"            json:"cluster_id,omitempty"`
+
+	// New since V1.10.0.
+	Cache        types.Cache        `bson:"cache"                           json:"cache"`
+	CacheEnable  bool               `bson:"cache_enable"                    json:"cache_enable"`
+	CacheDirType types.CacheDirType `bson:"cache_dir_type"                  json:"cache_dir_type"`
+	CacheUserDir string             `bson:"cache_user_dir"                  json:"cache_user_dir"`
+}
+
+type ArtifactInfo struct {
+	URL          string `bson:"url"                 json:"url"`
+	WorkflowName string `bson:"workflow_name"       json:"workflow_name"`
+	TaskID       int64  `bson:"task_id"             json:"task_id"`
+	FileName     string `bson:"file_name"           json:"file_name"`
 }
 
 //type Item struct {
@@ -110,9 +129,11 @@ type DockerBuildStatus struct {
 }
 
 type JobCtx struct {
-	EnableProxy    bool          `bson:"enable_proxy"                   json:"enable_proxy"`
-	Proxy          *models.Proxy `bson:"proxy"                          json:"proxy"`
-	CleanWorkspace bool          `bson:"clean_workspace"                json:"clean_workspace"`
+	EnableProxy bool          `bson:"enable_proxy"                   json:"enable_proxy"`
+	Proxy       *models.Proxy `bson:"proxy"                          json:"proxy"`
+
+	// TODO: Deprecated.
+	CleanWorkspace bool `bson:"clean_workspace"                json:"clean_workspace"`
 
 	// BuildJobCtx
 	Builds     []*types.Repository `bson:"builds"                         json:"builds"`
@@ -134,9 +155,9 @@ type JobCtx struct {
 	DockerBuildCtx *DockerBuildCtx `bson:"docker_build_ctx,omitempty" json:"docker_build_ctx,omitempty"`
 	FileArchiveCtx *FileArchiveCtx `bson:"file_archive_ctx,omitempty" json:"file_archive_ctx,omitempty"`
 	// TestType
-	TestType string `bson:"test_type"                       json:"test_type"`
-	// Caches
+	TestType      string   `bson:"test_type"                       json:"test_type"`
 	Caches        []string `bson:"caches" json:"caches"`
+	ArtifactPath  string   `bson:"artifact_path,omitempty"  json:"artifact_path,omitempty"`
 	ArtifactPaths []string `bson:"artifact_paths,omitempty" json:"artifact_paths,omitempty"`
 	IsHasArtifact bool     `bson:"is_has_artifact" json:"is_has_artifact"`
 	// StorageUri is used for qbox release-candidates

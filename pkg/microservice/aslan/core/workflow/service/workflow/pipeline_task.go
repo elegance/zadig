@@ -17,12 +17,12 @@ limitations under the License.
 package workflow
 
 import (
-	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"go.uber.org/zap"
@@ -40,10 +40,11 @@ import (
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/s3"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/scmnotify"
 	"github.com/koderover/zadig/pkg/setting"
-	"github.com/koderover/zadig/pkg/shared/poetry"
+	"github.com/koderover/zadig/pkg/shared/client/systemconfig"
 	e "github.com/koderover/zadig/pkg/tool/errors"
 	krkubeclient "github.com/koderover/zadig/pkg/tool/kube/client"
 	"github.com/koderover/zadig/pkg/tool/kube/getter"
+	s3tool "github.com/koderover/zadig/pkg/tool/s3"
 	"github.com/koderover/zadig/pkg/types"
 )
 
@@ -67,7 +68,9 @@ func CreatePipelineTask(args *commonmodels.TaskArgs, log *zap.SugaredLogger) (*C
 
 	// 如果用户使用预定义编译配置, 则从编译模块配置中生成SubTasks
 	if pipeline.BuildModuleVer != "" {
-		subTasks, err := BuildModuleToSubTasks("", pipeline.BuildModuleVer, pipeline.Target, "", "", nil, nil, log)
+		subTasks, err := BuildModuleToSubTasks(&commonmodels.BuildModuleArgs{
+			Target: pipeline.Target,
+		}, log)
 		if err != nil {
 			return nil, e.ErrCreateTask.AddErr(err)
 		}
@@ -111,7 +114,7 @@ func CreatePipelineTask(args *commonmodels.TaskArgs, log *zap.SugaredLogger) (*C
 			}
 
 			if build.Registries == nil {
-				registries, err := commonservice.ListRegistryNamespaces(log)
+				registries, err := commonservice.ListRegistryNamespaces(true, log)
 				if err != nil {
 					log.Errorf("ListRegistryNamespaces err:%v", err)
 				} else {
@@ -145,7 +148,7 @@ func CreatePipelineTask(args *commonmodels.TaskArgs, log *zap.SugaredLogger) (*C
 			}
 
 			if testing.Registries == nil {
-				registries, err := commonservice.ListRegistryNamespaces(log)
+				registries, err := commonservice.ListRegistryNamespaces(true, log)
 				if err != nil {
 					log.Errorf("ListRegistryNamespaces err:%v", err)
 				} else {
@@ -162,7 +165,7 @@ func CreatePipelineTask(args *commonmodels.TaskArgs, log *zap.SugaredLogger) (*C
 		}
 	}
 
-	jiraInfo, _ := poetry.GetJiraInfo(config.PoetryAPIServer(), config.PoetryAPIRootKey())
+	jiraInfo, _ := systemconfig.New().GetJiraInfo()
 	if jiraInfo != nil {
 		jiraTask, err := AddPipelineJiraSubTask(pipeline, log)
 		if err != nil {
@@ -195,7 +198,6 @@ func CreatePipelineTask(args *commonmodels.TaskArgs, log *zap.SugaredLogger) (*C
 		MultiRun:       pipeline.MultiRun,
 		BuildModuleVer: pipeline.BuildModuleVer,
 		Target:         pipeline.Target,
-		OrgID:          pipeline.OrgID,
 		StorageURI:     defaultStorageURI,
 	}
 
@@ -230,7 +232,7 @@ func CreatePipelineTask(args *commonmodels.TaskArgs, log *zap.SugaredLogger) (*C
 		}
 	}
 
-	repos, err := commonrepo.NewRegistryNamespaceColl().FindAll(&commonrepo.FindRegOps{})
+	repos, err := commonservice.ListRegistryNamespaces(false, log)
 	if err != nil {
 		return nil, e.ErrCreateTask.AddErr(err)
 	}
@@ -240,7 +242,10 @@ func CreatePipelineTask(args *commonmodels.TaskArgs, log *zap.SugaredLogger) (*C
 		pt.ConfigPayload.RepoConfigs[repo.ID.Hex()] = repo
 	}
 
-	if err := ensurePipelineTask(pt, log); err != nil {
+	if err := ensurePipelineTask(&task.TaskOpt{
+		Task:    pt,
+		EnvName: pt.TaskArgs.Deploy.Namespace,
+	}, log); err != nil {
 		log.Errorf("Service.ensurePipelineTask failed %v %v", args, err)
 		if err, ok := err.(*ContainerNotFound); ok {
 			return nil, e.NewWithExtras(
@@ -275,6 +280,7 @@ func CreatePipelineTask(args *commonmodels.TaskArgs, log *zap.SugaredLogger) (*C
 	scmnotify.NewService().UpdatePipelineWebhookComment(pt, log)
 
 	resp := &CreateTaskResp{
+		ProjectName:  args.ProductName,
 		PipelineName: args.PipelineName,
 		TaskID:       nextTaskID,
 	}
@@ -290,20 +296,44 @@ type TaskResult struct {
 }
 
 // ListPipelineTasksV2Result 工作流任务分页信息
-func ListPipelineTasksV2Result(name string, typeString config.PipelineType, maxResult, startAt int, log *zap.SugaredLogger) (*TaskResult, error) {
+func ListPipelineTasksV2Result(name string, typeString config.PipelineType, queryType string, filters []string, maxResult, startAt int, log *zap.SugaredLogger) (*TaskResult, error) {
 	ret := &TaskResult{MaxResult: maxResult, StartAt: startAt}
 	var err error
-	ret.Data, err = commonrepo.NewTaskColl().List(&commonrepo.ListTaskOption{PipelineName: name, Limit: maxResult, Skip: startAt, Detail: true, Type: typeString})
+	var listTaskOpt *commonrepo.ListTaskOption
+	var countTaskOpt *commonrepo.CountTaskOption
+	var restp []*commonrepo.TaskPreview
+	serviceNameFiltersMap := make(map[string]interface{}, len(filters))
+	if len(filters) == 0 || (len(filters) == 1 && filters[0] == "") {
+		queryType = ""
+	}
+	switch queryType {
+	case "creator":
+		listTaskOpt = &commonrepo.ListTaskOption{PipelineName: name, Limit: maxResult, Skip: startAt, TaskCreators: filters, Detail: true, Type: typeString}
+		countTaskOpt = &commonrepo.CountTaskOption{PipelineNames: []string{name}, TaskCreators: filters, Type: typeString}
+	case "committer":
+		listTaskOpt = &commonrepo.ListTaskOption{PipelineName: name, Limit: maxResult, Skip: startAt, Committers: filters, Detail: true, Type: typeString}
+		countTaskOpt = &commonrepo.CountTaskOption{PipelineNames: []string{name}, Committers: filters, Type: typeString}
+	case "serviceName":
+		listTaskOpt = &commonrepo.ListTaskOption{PipelineName: name, Detail: true, Type: typeString}
+		countTaskOpt = &commonrepo.CountTaskOption{PipelineNames: []string{name}, Type: typeString}
+		for _, svc := range filters {
+			serviceNameFiltersMap[svc] = nil
+		}
+	case "taskStatus":
+		listTaskOpt = &commonrepo.ListTaskOption{PipelineName: name, Limit: maxResult, Skip: startAt, Statuses: filters, Detail: true, Type: typeString}
+		countTaskOpt = &commonrepo.CountTaskOption{PipelineNames: []string{name}, Statuses: filters, Type: typeString}
+	default:
+		listTaskOpt = &commonrepo.ListTaskOption{PipelineName: name, Limit: maxResult, Skip: startAt, Detail: true, Type: typeString}
+		countTaskOpt = &commonrepo.CountTaskOption{PipelineNames: []string{name}, Type: typeString}
+	}
+	restp, err = commonrepo.NewTaskColl().List(listTaskOpt)
 	if err != nil {
-		log.Errorf("PipelineTaskV2.List error: %v", err)
+		log.Errorf("PipelineTaskV2.List:%s error: %s", listTaskOpt, err)
 		return ret, e.ErrListTasks
 	}
-
-	// 获取任务的服务列表
 	var buildStage, deployStage *commonmodels.Stage
-	for _, t := range ret.Data {
+	for _, t := range restp {
 		t.BuildServices = []string{}
-
 		for _, stage := range t.Stages {
 			if stage.TaskType == config.TaskBuild {
 				buildStage = stage
@@ -312,27 +342,48 @@ func ListPipelineTasksV2Result(name string, typeString config.PipelineType, maxR
 				deployStage = stage
 			}
 		}
-
-		// 有构建返回构建的服务，没构建返回部署的服务
+		existSvc := false
 		if buildStage != nil {
 			for serviceName := range buildStage.SubTasks {
+				if queryType == "serviceName" {
+					if _, ok := serviceNameFiltersMap[serviceName]; ok {
+						existSvc = true
+					}
+				}
 				t.BuildServices = append(t.BuildServices, serviceName)
 			}
 		} else if deployStage != nil {
 			for serviceName := range deployStage.SubTasks {
+				if queryType == "serviceName" {
+					if _, ok := serviceNameFiltersMap[serviceName]; ok {
+						existSvc = true
+					}
+				}
 				t.BuildServices = append(t.BuildServices, serviceName)
 			}
 		}
-
-		// 清理，下次循环再使用
-		buildStage = nil
-		deployStage = nil
+		buildStage, deployStage = nil, nil
+		if existSvc {
+			ret.Data = append(ret.Data, t)
+		}
 	}
-
-	pipelineList := []string{name}
-	ret.Total, err = commonrepo.NewTaskColl().Count(&commonrepo.CountTaskOption{PipelineNames: pipelineList, Type: typeString})
+	if queryType == "serviceName" {
+		ret.Total = len(ret.Data)
+		if startAt > ret.Total {
+			ret.Data = []*commonrepo.TaskPreview{}
+			return ret, nil
+		}
+		if startAt+maxResult <= ret.Total {
+			ret.Data = ret.Data[startAt : startAt+maxResult]
+		} else {
+			ret.Data = ret.Data[startAt:ret.Total]
+		}
+		return ret, nil
+	}
+	ret.Data = restp
+	ret.Total, err = commonrepo.NewTaskColl().Count(countTaskOpt)
 	if err != nil {
-		log.Errorf("PipelineTaskV2.List error: %v", err)
+		log.Errorf("PipelineTaskV2.List Count error: %v", err)
 		return ret, e.ErrCountTasks
 	}
 	return ret, nil
@@ -346,6 +397,62 @@ func GetPipelineTaskV2(taskID int64, pipelineName string, typeString config.Pipe
 	}
 
 	Clean(resp)
+	return resp, nil
+}
+
+func GetFiltersPipelineTaskV2(projectName, pipelineName, querytype string, typeString config.PipelineType, log *zap.SugaredLogger) ([]interface{}, error) {
+	resp := []interface{}{}
+	var err error
+	fieldName := ""
+	switch querytype {
+	case "creator":
+		fieldName = "task_creator"
+		resp, err = commonrepo.NewTaskColl().DistinctFieldsPipelineTask(fieldName, projectName, pipelineName, typeString, false)
+		if err != nil {
+			log.Errorf("[%s] DistinctFeildsPipelineTask fieldName: %s error: %s", fieldName, pipelineName, err)
+			return resp, e.ErrGetTask
+		}
+	case "committer":
+		fieldName = "workflow_args.committer"
+		resp, err = commonrepo.NewTaskColl().DistinctFieldsPipelineTask(fieldName, projectName, pipelineName, typeString, false)
+		if err != nil {
+			log.Errorf("[%s] DistinctFeildsPipelineTask fieldName: %s error: %s", fieldName, pipelineName, err)
+			return resp, e.ErrGetTask
+		}
+	case "serviceName":
+		data, err := commonrepo.NewTaskColl().List(&commonrepo.ListTaskOption{PipelineName: pipelineName, Detail: true, Type: typeString})
+		if err != nil {
+			log.Errorf("PipelineTaskV2.List error: %s", err)
+			return resp, e.ErrListTasks
+		}
+		var buildStage, deployStage *commonmodels.Stage
+		svcSets := sets.NewString()
+		for _, t := range data {
+			for _, stage := range t.Stages {
+				if stage.TaskType == config.TaskBuild {
+					buildStage = stage
+				}
+				if stage.TaskType == config.TaskDeploy {
+					deployStage = stage
+				}
+			}
+			if buildStage != nil {
+				for serviceName := range buildStage.SubTasks {
+					svcSets.Insert(serviceName)
+				}
+			} else if deployStage != nil {
+				for serviceName := range deployStage.SubTasks {
+					svcSets.Insert(serviceName)
+				}
+			}
+			buildStage, deployStage = nil, nil
+		}
+		for svc := range svcSets {
+			resp = append(resp, svc)
+		}
+	default:
+		return resp, fmt.Errorf("queryType parameter is invalid")
+	}
 	return resp, nil
 }
 
@@ -384,7 +491,7 @@ func RestartPipelineTaskV2(userName string, taskID int64, pipelineName string, t
 				subBuildTaskMap := subStage.SubTasks
 				for serviceModule, subTask := range subBuildTaskMap {
 					if buildInfo, err := base.ToBuildTask(subTask); err == nil {
-						if newModules, err := commonrepo.NewBuildColl().List(&commonrepo.BuildListOption{Version: "stable", Targets: []string{serviceModule}, ServiceName: buildInfo.Service, ProductName: t.ProductName}); err == nil {
+						if newModules, err := commonrepo.NewBuildColl().List(&commonrepo.BuildListOption{Targets: []string{serviceModule}, ServiceName: buildInfo.Service, ProductName: t.ProductName}); err == nil && len(newModules) > 0 {
 							newBuildInfo := newModules[0]
 							buildInfo.JobCtx.BuildSteps = []*task.BuildStep{}
 							if newBuildInfo.Scripts != "" {
@@ -411,6 +518,7 @@ func RestartPipelineTaskV2(userName string, taskID int64, pipelineName string, t
 								buildInfo.BuildOS = newBuildInfo.PreBuild.BuildOS
 								buildInfo.ImageFrom = newBuildInfo.PreBuild.ImageFrom
 								buildInfo.ResReq = newBuildInfo.PreBuild.ResReq
+								buildInfo.ResReqSpec = newBuildInfo.PreBuild.ResReqSpec
 							}
 
 							if newBuildInfo.PostBuild != nil && newBuildInfo.PostBuild.DockerBuild != nil {
@@ -475,6 +583,7 @@ func RestartPipelineTaskV2(userName string, taskID int64, pipelineName string, t
 								testInfo.BuildOS = newTestInfo.PreTest.BuildOS
 								testInfo.ImageFrom = newTestInfo.PreTest.ImageFrom
 								testInfo.ResReq = newTestInfo.PreTest.ResReq
+								testInfo.ResReqSpec = newTestInfo.PreTest.ResReqSpec
 							}
 							// 设置 build 安装脚本
 							testInfo.InstallCtx, err = buildInstallCtx(testInfo.InstallItems)
@@ -491,8 +600,10 @@ func RestartPipelineTaskV2(userName string, taskID int64, pipelineName string, t
 				}
 			case config.TaskDeploy:
 				resetImage := false
+				resetImagePolicy := setting.ResetImagePolicyTaskCompletedOrder
 				if workflow, err := commonrepo.NewWorkflowColl().Find(t.PipelineName); err == nil {
 					resetImage = workflow.ResetImage
+					resetImagePolicy = workflow.ResetImagePolicy
 				}
 				timeout := 0
 				if productTempl, err := template.NewProductColl().Find(t.ProductName); err == nil {
@@ -505,6 +616,7 @@ func RestartPipelineTaskV2(userName string, taskID int64, pipelineName string, t
 						deployInfo.Timeout = timeout
 						deployInfo.IsRestart = true
 						deployInfo.ResetImage = resetImage
+						deployInfo.ResetImagePolicy = resetImagePolicy
 						if newDeployInfo, err := deployInfo.ToSubTask(); err == nil {
 							subDeployTaskMap[serviceName] = newDeployInfo
 						}
@@ -526,6 +638,12 @@ func RestartPipelineTaskV2(userName string, taskID int64, pipelineName string, t
 func TestArgsToTestSubtask(args *commonmodels.TestTaskArgs, pt *task.Task, log *zap.SugaredLogger) (*task.Testing, error) {
 	var resp *task.Testing
 
+	testTask := &task.Testing{
+		TaskType: config.TaskTestingV2,
+		Enabled:  true,
+		TestName: "test",
+	}
+
 	allTestings, err := commonrepo.NewTestingColl().List(&commonrepo.ListTestOption{ProductName: args.ProductName, TestType: ""})
 	if err != nil {
 		log.Errorf("testArgsToTestSubtask TestingModule.List error: %v", err)
@@ -539,6 +657,8 @@ func TestArgsToTestSubtask(args *commonmodels.TestTaskArgs, pt *task.Task, log *
 				testArg.Builds = make([]*types.Repository, 0)
 			} else {
 				testArg.Builds = testing.Repos
+				pr, _ := strconv.Atoi(args.MergeRequestID)
+				testArg.Builds[0].PR = pr
 			}
 
 			if testing.PreTest != nil {
@@ -546,6 +666,29 @@ func TestArgsToTestSubtask(args *commonmodels.TestTaskArgs, pt *task.Task, log *
 			}
 
 			testArg.TestModuleName = args.TestName
+
+			// In some old testing configurations, the `pre_test.cluster_id` field is empty indicating that's a local cluster.
+			// We do a protection here to avoid query failure.
+			// Resaving the testing configuration after v1.8.0 will automatically populate this field.
+			if testing.PreTest.ClusterID == "" {
+				testing.PreTest.ClusterID = setting.LocalClusterID
+			}
+
+			clusterInfo, err := commonrepo.NewK8SClusterColl().Get(testing.PreTest.ClusterID)
+			if err != nil {
+				return resp, e.ErrListTestModule.AddDesc(err.Error())
+			}
+			testTask.Cache = clusterInfo.Cache
+
+			// If the cluster is not configured with a cache medium, the cache cannot be used, so don't enable cache explicitly.
+			if testTask.Cache.MediumType == "" {
+				testTask.CacheEnable = false
+			} else {
+				testTask.CacheEnable = testing.CacheEnable
+				testTask.CacheDirType = testing.CacheDirType
+				testTask.CacheUserDir = testing.CacheUserDir
+			}
+
 			break
 		}
 	}
@@ -555,23 +698,20 @@ func TestArgsToTestSubtask(args *commonmodels.TestTaskArgs, pt *task.Task, log *
 		log.Errorf("[%s]get TestingModule error: %v", args.TestName, err)
 		return resp, err
 	}
-	testTask := &task.Testing{
-		TaskType: config.TaskTestingV2,
-		Enabled:  true,
-		TestName: "test",
-		Timeout:  testModule.Timeout,
-	}
+	testTask.Timeout = testModule.Timeout
+
 	testTask.TestModuleName = testModule.Name
 	testTask.JobCtx.TestType = testModule.TestType
 	testTask.JobCtx.Builds = testModule.Repos
 	testTask.JobCtx.BuildSteps = append(testTask.JobCtx.BuildSteps, &task.BuildStep{BuildType: "shell", Scripts: testModule.Scripts})
 
 	testTask.JobCtx.TestResultPath = testModule.TestResultPath
+	testTask.JobCtx.TestReportPath = testModule.TestReportPath
 	testTask.JobCtx.TestThreshold = testModule.Threshold
 	testTask.JobCtx.Caches = testModule.Caches
 	testTask.JobCtx.ArtifactPaths = testModule.ArtifactPaths
 	if testTask.Registries == nil {
-		registries, err := commonservice.ListRegistryNamespaces(log)
+		registries, err := commonservice.ListRegistryNamespaces(true, log)
 		if err != nil {
 			log.Errorf("ListRegistryNamespaces err:%v", err)
 		} else {
@@ -582,6 +722,8 @@ func TestArgsToTestSubtask(args *commonmodels.TestTaskArgs, pt *task.Task, log *
 		testTask.InstallItems = testModule.PreTest.Installs
 		testTask.JobCtx.CleanWorkspace = testModule.PreTest.CleanWorkspace
 		testTask.JobCtx.EnableProxy = testModule.PreTest.EnableProxy
+		testTask.Namespace = testModule.PreTest.Namespace
+		testTask.ClusterID = testModule.PreTest.ClusterID
 
 		envs := testModule.PreTest.Envs[:]
 
@@ -600,6 +742,7 @@ func TestArgsToTestSubtask(args *commonmodels.TestTaskArgs, pt *task.Task, log *
 		testTask.BuildOS = testModule.PreTest.BuildOS
 		testTask.ImageFrom = testModule.PreTest.ImageFrom
 		testTask.ResReq = testModule.PreTest.ResReq
+		testTask.ResReqSpec = testModule.PreTest.ResReqSpec
 	}
 	// 设置 build 安装脚本
 	testTask.InstallCtx, err = buildInstallCtx(testTask.InstallItems)
@@ -609,7 +752,7 @@ func TestArgsToTestSubtask(args *commonmodels.TestTaskArgs, pt *task.Task, log *
 	}
 	// Iterate test jobctx builds, and replace it if params specified from task.
 	// 外部触发的pipeline
-	_ = setManunalBuilds(testTask.JobCtx.Builds, testArg.Builds)
+	_ = setManunalBuilds(testTask.JobCtx.Builds, testArg.Builds, log)
 	return testTask, nil
 }
 
@@ -903,9 +1046,16 @@ func GePackageFileContent(pipelineName string, taskID int64, log *zap.SugaredLog
 	defer func() {
 		_ = os.Remove(tmpfile.Name())
 	}()
-
-	err = s3.Download(context.Background(), storage, packageFile, tmpfile.Name())
-
+	forcedPathStyle := true
+	if storage.Provider == setting.ProviderSourceAli {
+		forcedPathStyle = false
+	}
+	client, err := s3tool.NewClient(storage.Endpoint, storage.Ak, storage.Sk, storage.Insecure, forcedPathStyle)
+	if err != nil {
+		return nil, packageFile, fmt.Errorf("failed to get s3 client to download %s, error is: %v", packageFile, err)
+	}
+	objectKey := storage.GetObjectPath(packageFile)
+	err = client.Download(storage.Bucket, objectKey, tmpfile.Name())
 	if err != nil {
 		return nil, packageFile, fmt.Errorf("failed to download %s %v", packageFile, err)
 	}
@@ -914,9 +1064,12 @@ func GePackageFileContent(pipelineName string, taskID int64, log *zap.SugaredLog
 }
 
 func GetArtifactFileContent(pipelineName string, taskID int64, log *zap.SugaredLogger) ([]byte, error) {
-	s3Storage, artifactFiles, _ := GetTestArtifactInfo(pipelineName, "", taskID, log)
-	tempdir, _ := ioutil.TempDir("", "")
-	sourcePath := path.Join(tempdir, "artifact")
+	s3Storage, client, artifactFiles, err := GetArtifactAndS3Info(pipelineName, "", taskID, log)
+	if err != nil {
+		return nil, fmt.Errorf("download artifact err: %s", err)
+	}
+	tempDir, _ := ioutil.TempDir("", "")
+	sourcePath := path.Join(tempDir, "artifact")
 	if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
 		_ = os.MkdirAll(sourcePath, 0777)
 	}
@@ -929,13 +1082,11 @@ func GetArtifactFileContent(pipelineName string, taskID int64, log *zap.SugaredL
 			if err != nil {
 				return nil, fmt.Errorf("failed to create file %s %v", artifactFileName, err)
 			}
-
 			defer func() {
 				_ = file.Close()
-				_ = os.Remove(path.Join(sourcePath, artifactFileName))
 			}()
 
-			err = s3.Download(context.Background(), s3Storage, artifactFile, file.Name())
+			err = client.Download(s3Storage.Bucket, artifactFile, file.Name())
 			if err != nil {
 				return nil, fmt.Errorf("failed to download %s %v", artifactFile, err)
 			}
@@ -944,36 +1095,47 @@ func GetArtifactFileContent(pipelineName string, taskID int64, log *zap.SugaredL
 	//将该目录压缩
 	goCacheManager := new(GoCacheManager)
 	artifactTarFileName := path.Join(sourcePath, "artifact.tar.gz")
-	err := goCacheManager.Archive(sourcePath, artifactTarFileName)
+	err = goCacheManager.Archive(sourcePath, artifactTarFileName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to Archive %s %v", sourcePath, err)
 	}
 	defer func() {
 		_ = os.Remove(artifactTarFileName)
-		_ = os.Remove(tempdir)
+		_ = os.Remove(tempDir)
 	}()
 
 	fileBytes, err := ioutil.ReadFile(path.Join(sourcePath, "artifact.tar.gz"))
 	return fileBytes, err
 }
 
-func GetTestArtifactInfo(pipelineName, dir string, taskID int64, log *zap.SugaredLogger) (*s3.S3, []string, error) {
+func GetArtifactAndS3Info(pipelineName, dir string, taskID int64, log *zap.SugaredLogger) (*s3.S3, *s3tool.Client, []string, error) {
 	fis := make([]string, 0)
 
-	if storage, err := s3.FindDefaultS3(); err == nil {
-		if storage.Subfolder != "" {
-			storage.Subfolder = fmt.Sprintf("%s/%s/%d/%s", storage.Subfolder, pipelineName, taskID, "artifact")
-		} else {
-			storage.Subfolder = fmt.Sprintf("%s/%d/%s", pipelineName, taskID, "artifact")
-		}
-		if files, err := s3.ListFiles(storage, dir, true); err == nil && len(files) > 0 {
-			return storage, files, nil
-		} else if err != nil {
-			log.Errorf("GetTestArtifactInfo ListFiles err:%v", err)
-		}
-	} else {
+	storage, err := s3.FindDefaultS3()
+	if err != nil {
 		log.Errorf("GetTestArtifactInfo FindDefaultS3 err:%v", err)
+		return nil, nil, fis, err
 	}
 
-	return nil, fis, nil
+	if storage.Subfolder != "" {
+		storage.Subfolder = fmt.Sprintf("%s/%s/%d/%s", storage.Subfolder, pipelineName, taskID, "artifact")
+	} else {
+		storage.Subfolder = fmt.Sprintf("%s/%d/%s", pipelineName, taskID, "artifact")
+	}
+	forcedPathStyle := true
+	if storage.Provider == setting.ProviderSourceAli {
+		forcedPathStyle = false
+	}
+	client, err := s3tool.NewClient(storage.Endpoint, storage.Ak, storage.Sk, storage.Insecure, forcedPathStyle)
+	if err != nil {
+		log.Errorf("GetTestArtifactInfo Create S3 client err:%+v", err)
+		return nil, nil, fis, err
+	}
+	prefix := storage.GetObjectPath(dir)
+	files, err := client.ListFiles(storage.Bucket, prefix, true)
+	if err != nil || len(files) <= 0 {
+		log.Errorf("GetTestArtifactInfo ListFiles err:%v", err)
+		return nil, nil, fis, err
+	}
+	return storage, client, files, nil
 }

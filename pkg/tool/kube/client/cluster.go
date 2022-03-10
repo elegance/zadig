@@ -22,6 +22,7 @@ import (
 
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -38,10 +39,22 @@ var c cluster.Cluster
 // Cluster is a singleton, it will be initialized only once.
 func Cluster() cluster.Cluster {
 	once.Do(func() {
-		c = initCluster(ctrl.GetConfigOrDie())
+		var err error
+		c, err = initCluster(ctrl.GetConfigOrDie())
+		if err != nil {
+			panic(err)
+		}
 	})
 
 	return c
+}
+
+func NewClientSet() (*kubernetes.Clientset, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, err
+	}
+	return kubernetes.NewForConfig(config)
 }
 
 func Client() client.Client {
@@ -77,7 +90,10 @@ func NewClientFromAPIConfig(cfg *api.Config) (client.Client, error) {
 		return nil, err
 	}
 
-	cls := initCluster(restConfig)
+	cls, err := initCluster(restConfig)
+	if err != nil {
+		return nil, err
+	}
 
 	return newAPIClient(cls.GetClient(), cls.GetAPIReader()), nil
 }
@@ -105,7 +121,7 @@ func (c *apiClient) List(ctx context.Context, list client.ObjectList, opts ...cl
 	return c.apiReader.List(ctx, list, opts...)
 }
 
-func initCluster(restConfig *rest.Config) cluster.Cluster {
+func initCluster(restConfig *rest.Config) (cluster.Cluster, error) {
 	scheme := runtime.NewScheme()
 
 	// add all known types
@@ -116,8 +132,8 @@ func initCluster(restConfig *rest.Config) cluster.Cluster {
 		clusterOptions.Scheme = scheme
 	})
 	if err != nil {
-		panic(errors.Wrap(err, "unable to init client"))
+		return nil, errors.Wrap(err, "unable to init client")
 	}
 
-	return c
+	return c, nil
 }

@@ -18,20 +18,23 @@ package reaper
 
 import (
 	"bufio"
-	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/koderover/zadig/pkg/microservice/reaper/config"
 	"github.com/koderover/zadig/pkg/microservice/reaper/internal/s3"
+	"github.com/koderover/zadig/pkg/setting"
 	"github.com/koderover/zadig/pkg/tool/httpclient"
 	"github.com/koderover/zadig/pkg/tool/log"
+	s3tool "github.com/koderover/zadig/pkg/tool/s3"
 	"github.com/koderover/zadig/pkg/util"
 )
 
@@ -75,35 +78,44 @@ func (r *Reaper) runIntallationScripts() error {
 				Endpoint: r.Ctx.StorageEndpoint,
 				Bucket:   r.Ctx.StorageBucket,
 				Insecure: true,
+				Provider: r.Ctx.StorageProvider,
 			}
 			store.Subfolder = fmt.Sprintf("%s/%s-v%s", config.ConstructCachePath, install.Name, install.Version)
 
 			filepath := strings.Split(install.Download, "/")
 			fileName := filepath[len(filepath)-1]
 			tmpPath = path.Join(os.TempDir(), fileName)
+			forcedPathStyle := true
+			if store.Provider == setting.ProviderSourceAli {
+				forcedPathStyle = false
+			}
+			s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
+			if err == nil {
+				objectKey := store.GetObjectPath(fileName)
+				err = s3client.Download(
+					store.Bucket,
+					objectKey,
+					tmpPath,
+				)
 
-			err = s3.ReaperDownload(
-				context.Background(),
-				store,
-				fileName,
-				tmpPath,
-			)
-
-			// 缓存不存在
-			if err != nil {
+				// 缓存不存在
+				if err != nil {
+					err := httpclient.Download(install.Download, tmpPath)
+					if err != nil {
+						return err
+					}
+					s3client.Upload(
+						store.Bucket,
+						tmpPath,
+						objectKey,
+					)
+					log.Infof("Package loaded from url: %s", install.Download)
+				}
+			} else {
 				err := httpclient.Download(install.Download, tmpPath)
 				if err != nil {
 					return err
 				}
-				s3.Upload(
-					context.Background(),
-					store,
-					tmpPath,
-					fileName,
-				)
-				log.Infof("Package loaded from url: %s", install.Download)
-			} else {
-				log.Info("Package loaded from cache")
 			}
 		}
 
@@ -138,7 +150,6 @@ func (r *Reaper) runIntallationScripts() error {
 }
 
 func (r *Reaper) createReadme(file string) error {
-
 	if r.Ctx.Archive == nil || len(r.Ctx.Repos) == 0 {
 		return nil
 	}
@@ -154,7 +165,6 @@ func (r *Reaper) createReadme(file string) error {
 	scripts = append(scripts, fmt.Sprintf("echo GIT-COMMIT: >> %s", file))
 
 	for _, repo := range r.Ctx.Repos {
-
 		if repo == nil || len(repo.Name) == 0 {
 			continue
 		}
@@ -196,6 +206,7 @@ func (r *Reaper) runScripts() error {
 	// avoid non-blocking IO for stdout to workaround "stdout: write error"
 	for _, script := range r.Ctx.Scripts {
 		scripts = append(scripts, script)
+		// TODO: This may cause nodejs compilation problems, but it is not completely determined, so keep it for now.
 		if strings.Contains(script, "yarn ") || strings.Contains(script, "npm ") || strings.Contains(script, "bower ") {
 			scripts = append(scripts, "echo 'turn off O_NONBLOCK after using node'")
 			scripts = append(scripts, "python -c 'import os,sys,fcntl; flags = fcntl.fcntl(sys.stdout, fcntl.F_GETFL); fcntl.fcntl(sys.stdout, fcntl.F_SETFL, flags&~os.O_NONBLOCK);'")
@@ -215,37 +226,41 @@ func (r *Reaper) runScripts() error {
 	//如果文件不存在就创建文件，避免后面使用变量出错
 	util.WriteFile(fileName, []byte{}, 0700)
 
-	cmdOutReader, err := cmd.StdoutPipe()
+	needPersistentLog := len(r.Ctx.PostScripts) > 0
+
+	var wg sync.WaitGroup
+
+	cmdStdoutReader, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
 	}
 
-	outScanner := bufio.NewScanner(cmdOutReader)
+	wg.Add(1)
 	go func() {
-		for outScanner.Scan() {
-			fmt.Printf("%s\n", r.maskSecretEnvs(outScanner.Text()))
-			if len(r.Ctx.PostScripts) > 0 {
-				util.WriteFile(fileName, []byte(outScanner.Text()+"\n"), 0700)
-			}
-		}
+		defer wg.Done()
+
+		r.handleCmdOutput(cmdStdoutReader, needPersistentLog, fileName)
 	}()
 
-	cmdErrReader, err := cmd.StderrPipe()
+	cmdStdErrReader, err := cmd.StderrPipe()
 	if err != nil {
 		return err
 	}
 
-	errScanner := bufio.NewScanner(cmdErrReader)
+	wg.Add(1)
 	go func() {
-		for errScanner.Scan() {
-			fmt.Printf("%s\n", r.maskSecretEnvs(errScanner.Text()))
-			if len(r.Ctx.PostScripts) > 0 {
-				util.WriteFile(fileName, []byte(errScanner.Text()+"\n"), 0700)
-			}
-		}
+		defer wg.Done()
+
+		r.handleCmdOutput(cmdStdErrReader, needPersistentLog, fileName)
 	}()
 
-	return cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	wg.Wait()
+
+	return cmd.Wait()
 }
 
 func (r *Reaper) prepareScriptsEnv() []string {
@@ -362,4 +377,65 @@ func (r *Reaper) RunPMDeployScripts() error {
 	}()
 
 	return cmd.Run()
+}
+
+func (r *Reaper) downloadArtifactFile() error {
+	var err error
+	var store *s3.S3
+	if store, err = s3.NewS3StorageFromEncryptedURI(r.Ctx.ArtifactInfo.URL, r.Ctx.AesKey); err != nil {
+		log.Errorf("Archive failed to create s3 storage %s", r.Ctx.ArtifactInfo.URL)
+		return err
+	}
+	if store.Subfolder != "" {
+		store.Subfolder = fmt.Sprintf("%s/%s/%d/%s", store.Subfolder, r.Ctx.ArtifactInfo.WorkflowName, r.Ctx.ArtifactInfo.TaskID, "file")
+	} else {
+		store.Subfolder = fmt.Sprintf("%s/%d/%s", r.Ctx.ArtifactInfo.WorkflowName, r.Ctx.ArtifactInfo.TaskID, "file")
+	}
+
+	forcedPathStyle := true
+	if store.Provider == setting.ProviderSourceAli {
+		forcedPathStyle = false
+	}
+	s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
+	if err != nil {
+		log.Errorf("s3 create client err:%s", err)
+		return err
+	}
+	files, err := s3client.ListFiles(store.Bucket, store.GetObjectPath(r.Ctx.ArtifactInfo.FileName), false)
+	if err != nil {
+		log.Errorf("s3 list file err:%s", err)
+		return err
+	}
+	if len(files) > 0 {
+		if err = s3client.Download(store.Bucket, files[0], fmt.Sprintf("%s/%s", r.ActiveWorkspace, r.Ctx.ArtifactInfo.FileName)); err != nil {
+			log.Errorf("s3 download file err:%s", err)
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Reaper) handleCmdOutput(pipe io.ReadCloser, needPersistentLog bool, logFile string) {
+	reader := bufio.NewReader(pipe)
+
+	for {
+		lineBytes, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+
+			log.Errorf("Failed to read log when processing cmd output: %s", err)
+			break
+		}
+
+		fmt.Printf("%s", r.maskSecretEnvs(string(lineBytes)))
+
+		if needPersistentLog {
+			err := util.WriteFile(logFile, lineBytes, 0700)
+			if err != nil {
+				log.Warnf("Failed to write file when processing cmd output: %s", err)
+			}
+		}
+	}
 }

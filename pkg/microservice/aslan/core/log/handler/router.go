@@ -18,14 +18,14 @@ package handler
 
 import (
 	"github.com/gin-gonic/gin"
-
-	gin2 "github.com/koderover/zadig/pkg/middleware/gin"
 )
 
 type Router struct{}
 
 func (*Router) Inject(router *gin.RouterGroup) {
-	router.Use(gin2.Auth())
+	{
+		router.GET("/pods/:name", GetContainerLogs)
+	}
 
 	log := router.Group("log")
 	{
@@ -33,6 +33,7 @@ func (*Router) Inject(router *gin.RouterGroup) {
 		log.GET("/workflow/:pipelineName/tasks/:taskId/service/:serviceName", GetWorkflowBuildJobContainerLogs)
 		log.GET("/pipelines/:pipelineName/tasks/:taskId/tests/:testName", GetTestJobContainerLogs)
 		log.GET("/workflow/:pipelineName/tasks/:taskId/tests/:testName/service/:serviceName", GetWorkflowTestJobContainerLogs)
+		log.GET("/v3/workflow/:workflowName/tasks/:taskId", GetWorkflowBuildV3JobContainerLogs)
 	}
 
 	sse := router.Group("sse")
@@ -43,5 +44,6 @@ func (*Router) Inject(router *gin.RouterGroup) {
 		sse.GET("/test/:pipelineName/:taskId/:testName/:lines", GetTestJobContainerLogsSSE)
 		sse.GET("/workflow/test/:pipelineName/:taskId/:testName/:lines/:serviceName", GetWorkflowTestJobContainerLogsSSE)
 		sse.GET("/service/build/:serviceName/:envName/:productName", GetServiceJobContainerLogsSSE)
+		sse.GET("/v3/workflow/build/:workflowName/:taskId/:lines", GetWorkflowBuildV3JobContainerLogsSSE)
 	}
 }

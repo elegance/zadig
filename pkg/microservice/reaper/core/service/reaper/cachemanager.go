@@ -18,7 +18,6 @@ package reaper
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -29,7 +28,9 @@ import (
 
 	"github.com/koderover/zadig/pkg/microservice/reaper/core/service/meta"
 	"github.com/koderover/zadig/pkg/microservice/reaper/internal/s3"
+	"github.com/koderover/zadig/pkg/setting"
 	"github.com/koderover/zadig/pkg/tool/log"
+	s3tool "github.com/koderover/zadig/pkg/tool/s3"
 	"github.com/koderover/zadig/pkg/util"
 )
 
@@ -79,13 +80,15 @@ type TarCacheManager struct {
 	StorageURI   string
 	PipelineName string
 	ServiceName  string
+	aesKey       string
 }
 
-func NewTarCacheManager(storageURI, pipelineName, serviceName string) *TarCacheManager {
+func NewTarCacheManager(storageURI, pipelineName, serviceName, aesKey string) *TarCacheManager {
 	return &TarCacheManager{
 		StorageURI:   storageURI,
 		PipelineName: pipelineName,
 		ServiceName:  serviceName,
+		aesKey:       aesKey,
 	}
 }
 
@@ -117,11 +120,17 @@ func (gcm *TarCacheManager) Archive(source, dest string) error {
 	//}
 
 	if store, err := gcm.getS3Storage(); err == nil {
-		if err = s3.Upload(
-			context.Background(),
-			store,
-			temp.Name(), meta.FileName,
-		); err != nil {
+		forcedPathStyle := true
+		if store.Provider == setting.ProviderSourceAli {
+			forcedPathStyle = false
+		}
+		s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
+		if err != nil {
+			log.Errorf("Archive s3 create s3 client error: %+v", err)
+			return err
+		}
+		objectKey := store.GetObjectPath(meta.FileName)
+		if err = s3client.Upload(store.Bucket, temp.Name(), objectKey); err != nil {
 			log.Errorf("Archive s3 upload err:%v", err)
 			return err
 		}
@@ -132,17 +141,21 @@ func (gcm *TarCacheManager) Archive(source, dest string) error {
 
 func (gcm *TarCacheManager) Unarchive(source, dest string) error {
 	if store, err := gcm.getS3Storage(); err == nil {
-		files, _ := s3.ListFiles(store, meta.FileName, false)
+		forcedPathStyle := true
+		if store.Provider == setting.ProviderSourceAli {
+			forcedPathStyle = false
+		}
+		s3client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
+		if err != nil {
+			return err
+		}
+		files, _ := s3client.ListFiles(store.Bucket, store.GetObjectPath(meta.FileName), false)
 		if len(files) > 0 {
 			if sourceFilename, err := util.GenerateTmpFile(); err == nil {
 				defer func() {
 					_ = os.Remove(sourceFilename)
 				}()
-				err := s3.Download(
-					context.Background(),
-					store,
-					files[0], sourceFilename,
-				)
+				err = s3client.Download(store.Bucket, files[0], sourceFilename)
 				if err != nil {
 					return err
 				}
@@ -169,7 +182,7 @@ func (gcm *TarCacheManager) Unarchive(source, dest string) error {
 func (gcm *TarCacheManager) getS3Storage() (*s3.S3, error) {
 	var err error
 	var store *s3.S3
-	if store, err = s3.NewS3StorageFromEncryptedURI(gcm.StorageURI); err != nil {
+	if store, err = s3.NewS3StorageFromEncryptedURI(gcm.StorageURI, gcm.aesKey); err != nil {
 		log.Errorf("Archive failed to create s3 storage %s", gcm.StorageURI)
 		return nil, err
 	}

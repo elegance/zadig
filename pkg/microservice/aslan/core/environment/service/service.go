@@ -25,17 +25,21 @@ import (
 	"helm.sh/helm/v3/pkg/releaseutil"
 	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/client-go/informers"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	commonmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	commonrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
 	commonservice "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/kube"
 	"github.com/koderover/zadig/pkg/setting"
+	kubeclient "github.com/koderover/zadig/pkg/shared/kube/client"
 	internalresource "github.com/koderover/zadig/pkg/shared/kube/resource"
 	"github.com/koderover/zadig/pkg/shared/kube/wrapper"
 	e "github.com/koderover/zadig/pkg/tool/errors"
 	"github.com/koderover/zadig/pkg/tool/kube/getter"
+	"github.com/koderover/zadig/pkg/tool/kube/informer"
 	"github.com/koderover/zadig/pkg/tool/kube/serializer"
 	"github.com/koderover/zadig/pkg/tool/kube/updater"
 	"github.com/koderover/zadig/pkg/tool/log"
@@ -59,7 +63,7 @@ func ScaleService(envName, productName, serviceName string, number int, log *zap
 		return e.ErrScaleService.AddErr(err)
 	}
 
-	kubeClient, err := kube.GetKubeClient(prod.ClusterID)
+	kubeClient, err := kubeclient.GetKubeClient(config.HubServerAddress(), prod.ClusterID)
 	if err != nil {
 		return e.ErrScaleService.AddErr(err)
 	}
@@ -110,7 +114,7 @@ func Scale(args *ScaleArgs, logger *zap.SugaredLogger) error {
 		return e.ErrScaleService.AddErr(err)
 	}
 
-	kubeClient, err := kube.GetKubeClient(prod.ClusterID)
+	kubeClient, err := kubeclient.GetKubeClient(config.HubServerAddress(), prod.ClusterID)
 	if err != nil {
 		return e.ErrScaleService.AddErr(err)
 	}
@@ -140,9 +144,25 @@ func RestartScale(args *RestartScaleArgs, _ *zap.SugaredLogger) error {
 		return err
 	}
 
-	kubeClient, err := kube.GetKubeClient(prod.ClusterID)
+	kubeClient, err := kubeclient.GetKubeClient(config.HubServerAddress(), prod.ClusterID)
 	if err != nil {
 		return err
+	}
+
+	// aws secrets needs to be refreshed
+	regs, err := commonservice.ListRegistryNamespaces(true, log.SugaredLogger())
+	if err != nil {
+		log.Errorf("Failed to get registries to restart container, the error is: %s", err)
+		return err
+	}
+	for _, reg := range regs {
+		if reg.RegProvider == config.RegistryTypeAWS {
+			if err := kube.CreateOrUpdateRegistrySecret(prod.Namespace, reg, kubeClient); err != nil {
+				retErr := fmt.Errorf("failed to update pull secret for registry: %s, the error is: %s", reg.ID.Hex(), err)
+				log.Errorf("%s\n", retErr.Error())
+				return retErr
+			}
+		}
 	}
 
 	switch args.Type {
@@ -160,11 +180,14 @@ func RestartScale(args *RestartScaleArgs, _ *zap.SugaredLogger) error {
 	return nil
 }
 
-func GetService(envName, productName, serviceName string, log *zap.SugaredLogger) (ret *SvcResp, err error) {
+func GetService(envName, productName, serviceName string, workLoadType string, log *zap.SugaredLogger) (ret *SvcResp, err error) {
 	ret = &SvcResp{
 		ServiceName: serviceName,
 		EnvName:     envName,
 		ProductName: productName,
+		Services:    make([]*internalresource.Service, 0),
+		Ingress:     make([]*internalresource.Ingress, 0),
+		Scales:      make([]*internalresource.Workload, 0),
 	}
 
 	opt := &commonrepo.ProductFindOptions{Name: productName, EnvName: envName}
@@ -173,7 +196,7 @@ func GetService(envName, productName, serviceName string, log *zap.SugaredLogger
 		return nil, e.ErrGetService.AddErr(err)
 	}
 
-	kubeClient, err := kube.GetKubeClient(env.ClusterID)
+	kubeClient, err := kubeclient.GetKubeClient(config.HubServerAddress(), env.ClusterID)
 	if err != nil {
 		return nil, e.ErrGetService.AddErr(err)
 	}
@@ -181,39 +204,46 @@ func GetService(envName, productName, serviceName string, log *zap.SugaredLogger
 	namespace := env.Namespace
 	switch env.Source {
 	case setting.SourceFromExternal, setting.SourceFromHelm:
-		svc, found, err := getter.GetService(namespace, serviceName, kubeClient)
-		if err != nil {
-			return nil, e.ErrGetService.AddErr(err)
+		if workLoadType == "undefined" && env.Source == setting.SourceFromExternal {
+			svcOpt := &commonrepo.ServiceFindOption{ProductName: productName, ServiceName: serviceName, Type: setting.K8SDeployType}
+			modelSvc, err := commonrepo.NewServiceColl().Find(svcOpt)
+			if err != nil {
+				return nil, e.ErrGetService.AddErr(err)
+			}
+			workLoadType = modelSvc.WorkloadType
 		}
-		if !found {
+		k8sServices, _ := getter.ListServices(namespace, nil, kubeClient)
+		switch workLoadType {
+		case setting.StatefulSet:
+			statefulSet, found, err := getter.GetStatefulSet(namespace, serviceName, kubeClient)
+			if !found || err != nil {
+				return nil, e.ErrGetService.AddDesc(fmt.Sprintf("service %s not found", serviceName))
+			}
+			scale := getStatefulSetWorkloadResource(statefulSet, kubeClient, log)
+			ret.Scales = append(ret.Scales, scale)
+			podLabels := labels.Set(statefulSet.Spec.Template.GetLabels())
+			for _, svc := range k8sServices {
+				if labels.SelectorFromValidatedSet(svc.Spec.Selector).Matches(podLabels) {
+					ret.Services = append(ret.Services, wrapper.Service(svc).Resource())
+					break
+				}
+			}
+		case setting.Deployment:
+			deploy, found, err := getter.GetDeployment(namespace, serviceName, kubeClient)
+			if !found || err != nil {
+				return nil, e.ErrGetService.AddDesc(fmt.Sprintf("service %s not found", serviceName))
+			}
+			scale := getDeploymentWorkloadResource(deploy, kubeClient, log)
+			ret.Scales = append(ret.Scales, scale)
+			podLabels := labels.Set(deploy.Spec.Template.GetLabels())
+			for _, svc := range k8sServices {
+				if labels.SelectorFromValidatedSet(svc.Spec.Selector).Matches(podLabels) {
+					ret.Services = append(ret.Services, wrapper.Service(svc).Resource())
+					break
+				}
+			}
+		default:
 			return nil, e.ErrGetService.AddDesc(fmt.Sprintf("service %s not found", serviceName))
-		}
-		ret.Services = append(ret.Services, wrapper.Service(svc).Resource())
-
-		selector := labels.SelectorFromValidatedSet(svc.Spec.Selector)
-		//deployment
-		if deployments, err := getter.ListDeployments(namespace, selector, kubeClient); err == nil {
-			log.Infof("namespace:%s , serviceName:%s , selector:%s , len(deployments):%d", namespace, serviceName, selector, len(deployments))
-			for _, d := range deployments {
-				scale := getDeploymentWorkloadResource(d, kubeClient, log)
-				ret.Scales = append(ret.Scales, scale)
-			}
-		}
-		//statefulSets
-		if statefulSets, err := getter.ListStatefulSets(namespace, selector, kubeClient); err == nil {
-			log.Infof("namespace:%s , serviceName:%s , selector:%s , len(statefulSets):%d", namespace, serviceName, selector, len(statefulSets))
-			for _, sts := range statefulSets {
-				scale := getStatefulSetWorkloadResource(sts, kubeClient, log)
-				ret.Scales = append(ret.Scales, scale)
-			}
-		}
-
-		//ingress
-		if ingresses, err := getter.ListIngresses(namespace, selector, kubeClient); err == nil {
-			log.Infof("namespace:%s , serviceName:%s , selector:%s , len(ingresses):%d", namespace, serviceName, selector, len(ingresses))
-			for _, ing := range ingresses {
-				ret.Ingress = append(ret.Ingress, wrapper.Ingress(ing).Resource())
-			}
 		}
 	default:
 		var service *commonmodels.ProductService
@@ -235,6 +265,7 @@ func GetService(envName, productName, serviceName string, log *zap.SugaredLogger
 		// 获取服务模板
 		opt := &commonrepo.ServiceFindOption{
 			ServiceName:   service.ServiceName,
+			ProductName:   service.ProductName,
 			Type:          service.Type,
 			Revision:      service.Revision,
 			ExcludeStatus: setting.ProductStatusDeleting,
@@ -307,18 +338,6 @@ func GetService(envName, productName, serviceName string, log *zap.SugaredLogger
 		}
 	}
 
-	if len(ret.Ingress) == 0 {
-		ret.Ingress = make([]*internalresource.Ingress, 0)
-	}
-
-	if len(ret.Scales) == 0 {
-		ret.Scales = make([]*internalresource.Workload, 0)
-	}
-
-	if len(ret.Services) == 0 {
-		ret.Services = make([]*internalresource.Service, 0)
-	}
-
 	return
 }
 
@@ -331,9 +350,34 @@ func RestartService(envName string, args *SvcOptArgs, log *zap.SugaredLogger) (e
 	if err != nil {
 		return err
 	}
-	kubeClient, err := kube.GetKubeClient(productObj.ClusterID)
+	kubeClient, err := kubeclient.GetKubeClient(config.HubServerAddress(), productObj.ClusterID)
 	if err != nil {
 		return err
+	}
+
+	cls, err := kubeclient.GetKubeClientSet(config.HubServerAddress(), productObj.ClusterID)
+	if err != nil {
+		return e.ErrCreateEnv.AddErr(err)
+	}
+	inf, err := informer.NewInformer(productObj.ClusterID, productObj.Namespace, cls)
+	if err != nil {
+		return e.ErrCreateEnv.AddErr(err)
+	}
+
+	// aws secrets needs to be refreshed
+	regs, err := commonservice.ListRegistryNamespaces(true, log)
+	if err != nil {
+		log.Errorf("Failed to get registries to restart container, the error is: %s", err)
+		return err
+	}
+	for _, reg := range regs {
+		if reg.RegProvider == config.RegistryTypeAWS {
+			if err := kube.CreateOrUpdateRegistrySecret(productObj.Namespace, reg, kubeClient); err != nil {
+				retErr := fmt.Errorf("failed to update pull secret for registry: %s, the error is: %s", reg.ID.Hex(), err)
+				log.Errorf("%s\n", retErr.Error())
+				return retErr
+			}
+		}
 	}
 
 	switch productObj.Source {
@@ -373,7 +417,7 @@ func RestartService(envName string, args *SvcOptArgs, log *zap.SugaredLogger) (e
 				if serviceObj.ServiceName == args.ServiceName {
 					productService = serviceObj
 					serviceTmpl, err = commonservice.GetServiceTemplate(
-						serviceObj.ServiceName, setting.K8SDeployType, "", setting.ProductStatusDeleting, serviceObj.Revision, log,
+						serviceObj.ServiceName, setting.K8SDeployType, serviceObj.ProductName, setting.ProductStatusDeleting, serviceObj.Revision, log,
 					)
 					if err != nil {
 						err = e.ErrDeleteProduct.AddDesc(e.DeleteServiceContainerErrMsg + ": " + err.Error())
@@ -398,7 +442,7 @@ func RestartService(envName string, args *SvcOptArgs, log *zap.SugaredLogger) (e
 					productObj,
 					productService,
 					productService,
-					newRender, kubeClient, log)
+					newRender, inf, kubeClient, log)
 
 				// 如果创建依赖服务组有返回错误, 停止等待
 				if err != nil {
@@ -411,7 +455,7 @@ func RestartService(envName string, args *SvcOptArgs, log *zap.SugaredLogger) (e
 	return nil
 }
 
-func queryPodsStatus(namespace, productName, serviceName string, kubeClient client.Client, log *zap.SugaredLogger) (string, string, []string) {
+func queryPodsStatus(namespace, productName, serviceName string, informer informers.SharedInformerFactory, log *zap.SugaredLogger) (string, string, []string) {
 	ls := labels.Set{}
 	if productName != "" {
 		ls[setting.ProductLabel] = productName
@@ -419,7 +463,7 @@ func queryPodsStatus(namespace, productName, serviceName string, kubeClient clie
 	if serviceName != "" {
 		ls[setting.ServiceLabel] = serviceName
 	}
-	return kube.GetSelectedPodsInfo(namespace, ls.AsSelector(), kubeClient, log)
+	return kube.GetSelectedPodsInfo(ls.AsSelector(), informer, log)
 }
 
 // validateServiceContainer validate container with envName like dev
@@ -430,7 +474,7 @@ func validateServiceContainer(envName, productName, serviceName, container strin
 		return "", err
 	}
 
-	kubeClient, err := kube.GetKubeClient(prod.ClusterID)
+	kubeClient, err := kubeclient.GetKubeClient(config.HubServerAddress(), prod.ClusterID)
 	if err != nil {
 		return "", err
 	}

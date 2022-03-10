@@ -25,17 +25,19 @@ import (
 
 	"github.com/hashicorp/go-multierror"
 	"go.uber.org/zap"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/informers"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	commonmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	commonrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
+	templaterepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb/template"
 	commonservice "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service"
-	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/kube"
 	"github.com/koderover/zadig/pkg/setting"
+	kubeclient "github.com/koderover/zadig/pkg/shared/kube/client"
 	e "github.com/koderover/zadig/pkg/tool/errors"
+	"github.com/koderover/zadig/pkg/tool/kube/informer"
 )
 
 type K8sService struct {
@@ -47,11 +49,11 @@ type K8sService struct {
 // If service doesnt have pods, service status = success (all objects created) or failed (fail to create some objects).
 // 正常：StatusRunning or StatusSucceed
 // 错误：StatusError or StatusFailed
-func (k *K8sService) queryServiceStatus(namespace, envName, productName string, serviceTmpl *commonmodels.Service, kubeClient client.Client) (string, string, []string) {
+func (k *K8sService) queryServiceStatus(namespace, envName, productName string, serviceTmpl *commonmodels.Service, informer informers.SharedInformerFactory) (string, string, []string) {
 	k.log.Infof("queryServiceStatus of service: %s of product: %s in namespace %s", serviceTmpl.ServiceName, productName, namespace)
 	if len(serviceTmpl.Containers) > 0 {
 		// 有容器时，根据pods status判断服务状态
-		return queryPodsStatus(namespace, productName, serviceTmpl.ServiceName, kubeClient, k.log)
+		return queryPodsStatus(namespace, productName, serviceTmpl.ServiceName, informer, k.log)
 	}
 
 	return setting.PodSucceeded, setting.PodReady, []string{}
@@ -63,8 +65,18 @@ func (k *K8sService) updateService(args *SvcOptArgs) error {
 		Type:        args.ServiceType,
 		Revision:    args.ServiceRev.NextRevision,
 		Containers:  args.ServiceRev.Containers,
-		Configs:     make([]*commonmodels.ServiceConfig, 0),
 	}
+
+	project, err := templaterepo.NewProductColl().Find(args.ProductName)
+	if err != nil {
+		k.log.Errorf("Can not find project %s, err: %s", args.ProductName, err)
+		return err
+	}
+	serviceInfo := project.GetServiceInfo(args.ServiceName)
+	if serviceInfo == nil {
+		return fmt.Errorf("service %s not found", args.ServiceName)
+	}
+	svc.ProductName = serviceInfo.Owner
 
 	opt := &commonrepo.ProductFindOptions{Name: args.ProductName, EnvName: args.EnvName}
 	exitedProd, err := commonrepo.NewProductColl().Find(opt)
@@ -73,9 +85,18 @@ func (k *K8sService) updateService(args *SvcOptArgs) error {
 		return errors.New(e.UpsertServiceErrMsg)
 	}
 
-	kubeClient, err := kube.GetKubeClient(exitedProd.ClusterID)
+	kubeClient, err := kubeclient.GetKubeClient(config.HubServerAddress(), exitedProd.ClusterID)
 	if err != nil {
 		return e.ErrUpdateEnv.AddErr(err)
+	}
+
+	cls, err := kubeclient.GetKubeClientSet(config.HubServerAddress(), exitedProd.ClusterID)
+	if err != nil {
+		return e.ErrUpdateEnv.AddDesc(err.Error())
+	}
+	inf, err := informer.NewInformer(exitedProd.ClusterID, exitedProd.Namespace, cls)
+	if err != nil {
+		return e.ErrUpdateEnv.AddDesc(err.Error())
 	}
 
 	switch exitedProd.Status {
@@ -89,39 +110,24 @@ func (k *K8sService) updateService(args *SvcOptArgs) error {
 		exitedProd.Render = &commonmodels.RenderInfo{ProductTmpl: exitedProd.ProductName}
 	}
 	// 检查renderset是否覆盖服务所有key
-	newRender, err := commonservice.ValidateRenderSet(args.ProductName, exitedProd.Render.Name, args.ServiceName, k.log)
+	newRender, err := commonservice.ValidateRenderSet(args.ProductName, exitedProd.Render.Name, serviceInfo, k.log)
 	if err != nil {
 		k.log.Errorf("[%s][P:%s] validate product renderset error: %v", args.EnvName, args.ProductName, err)
 		return e.ErrUpdateProduct.AddDesc(err.Error())
 	}
 	svc.Render = &commonmodels.RenderInfo{Name: newRender.Name, Revision: newRender.Revision, ProductTmpl: newRender.ProductTmpl}
 
-	for _, cr := range args.ServiceRev.ConfigRevisions {
-		cfg := &commonmodels.ServiceConfig{
-			ConfigName: cr.ConfigName,
-			Revision:   cr.NextRevision,
-		}
-		svc.Configs = append(svc.Configs, cfg)
-	}
-
 	_, err = upsertService(
 		true,
 		exitedProd,
 		svc,
 		exitedProd.GetServiceMap()[svc.ServiceName],
-		newRender, kubeClient, k.log)
+		newRender, inf, kubeClient, k.log)
 
 	// 如果创建依赖服务组有返回错误, 停止等待
 	if err != nil {
 		k.log.Error(err)
 		return e.ErrUpdateProduct.AddDesc(err.Error())
-	}
-
-	// 只有配置模板改动才会重启pod
-	err = restartService(args.EnvName, args.ProductName, args.ServiceRev, k.log)
-	if err != nil {
-		k.log.Error(err)
-		return err
 	}
 
 	// 更新产品服务
@@ -140,9 +146,7 @@ func (k *K8sService) updateService(args *SvcOptArgs) error {
 	return nil
 }
 
-// TODO: LOU: improve the status scope and definition, like pod status, service status, environment, cluster status, ...
-// TODO: LOU: rewrite it
-func (k *K8sService) listGroupServices(allServices []*commonmodels.ProductService, envName, productName string, kubeClient client.Client, productInfo *commonmodels.Product) []*commonservice.ServiceResp {
+func (k *K8sService) listGroupServices(allServices []*commonmodels.ProductService, envName, productName string, informer informers.SharedInformerFactory, productInfo *commonmodels.Product) []*commonservice.ServiceResp {
 	var wg sync.WaitGroup
 	var resp []*commonservice.ServiceResp
 	var mutex sync.RWMutex
@@ -157,7 +161,7 @@ func (k *K8sService) listGroupServices(allServices []*commonmodels.ProductServic
 				EnvName:     envName,
 			}
 			serviceTmpl, err := commonservice.GetServiceTemplate(
-				service.ServiceName, setting.K8SDeployType, "", "", service.Revision, k.log,
+				service.ServiceName, setting.K8SDeployType, service.ProductName, "", service.Revision, k.log,
 			)
 			if err != nil {
 				gp.Status = setting.PodFailed
@@ -169,8 +173,8 @@ func (k *K8sService) listGroupServices(allServices []*commonmodels.ProductServic
 
 			gp.ProductName = serviceTmpl.ProductName
 			// 查询group下所有pods信息
-			if kubeClient != nil {
-				gp.Status, gp.Ready, gp.Images = k.queryServiceStatus(productInfo.Namespace, envName, productName, serviceTmpl, kubeClient)
+			if informer != nil {
+				gp.Status, gp.Ready, gp.Images = k.queryServiceStatus(productInfo.Namespace, envName, productName, serviceTmpl, informer)
 				// 如果产品正在创建中，且service status为ERROR（POD还没创建出来），则判断为Pending，尚未开始创建
 				if productInfo.Status == setting.ProductStatusCreating && gp.Status == setting.PodError {
 					gp.Status = setting.PodPending
@@ -195,7 +199,7 @@ func (k *K8sService) listGroupServices(allServices []*commonmodels.ProductServic
 	return resp
 }
 
-func (k *K8sService) createGroup(envName, productName, username string, group []*commonmodels.ProductService, renderSet *commonmodels.RenderSet, kubeClient client.Client) error {
+func (k *K8sService) createGroup(envName, productName, username string, group []*commonmodels.ProductService, renderSet *commonmodels.RenderSet, informer informers.SharedInformerFactory, kubeClient client.Client) error {
 	k.log.Infof("[Namespace:%s][Product:%s] createGroup", envName, productName)
 	updatableServiceNameList := make([]string, 0)
 
@@ -228,7 +232,7 @@ func (k *K8sService) createGroup(envName, productName, username string, group []
 		updatableServiceNameList = append(updatableServiceNameList, group[i].ServiceName)
 		go func(svc *commonmodels.ProductService) {
 			defer wg.Done()
-			items, err := upsertService(false, prod, svc, nil, renderSet, kubeClient, k.log)
+			items, err := upsertService(false, prod, svc, nil, renderSet, informer, kubeClient, k.log)
 			if err != nil {
 				lock.Lock()
 				switch e := err.(type) {

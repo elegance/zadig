@@ -17,10 +17,29 @@ limitations under the License.
 package gitlab
 
 import (
+	"github.com/27149chen/afero"
+
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/git"
 )
 
-func (c *Client) GetLatestRepositoryCommit(owner, repo, branch, path string) (*git.RepositoryCommit, error) {
-	res, err := c.Client.GetLatestRepositoryCommit(owner, repo, branch, path)
+func (c *Client) GetTree(owner, repo, path, branch string) ([]*git.TreeNode, error) {
+	var treeNodes []*git.TreeNode
+
+	tns, err := c.ListTree(owner, repo, path, branch, false, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, t := range tns {
+		treeNodes = append(treeNodes, git.ToTreeNode(t))
+	}
+	return treeNodes, nil
+}
+
+func (c *Client) GetTreeContents(owner, repo, path, branch string) (afero.Fs, error) {
+	return c.Client.GetTreeContents(owner, repo, path, branch)
+}
+
+func (c *Client) GetLatestRepositoryCommit(owner, repo, path, branch string) (*git.RepositoryCommit, error) {
+	res, err := c.Client.GetLatestRepositoryCommit(owner, repo, path, branch)
 	return git.ToRepositoryCommit(res), err
 }

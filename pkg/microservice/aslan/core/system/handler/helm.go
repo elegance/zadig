@@ -44,11 +44,12 @@ func CreateHelmRepo(c *gin.Context) {
 		ctx.Err = e.ErrInvalidParam.AddDesc("invalid helmRepo json args")
 		return
 	}
-	args.UpdateBy = ctx.Username
+	args.UpdateBy = ctx.UserName
 	if _, err := url.Parse(args.URL); err != nil {
 		ctx.Err = e.ErrInvalidParam.AddDesc("invalid url")
 		return
 	}
+
 	ctx.Err = service.CreateHelmRepo(args, ctx.Logger)
 }
 
@@ -61,7 +62,7 @@ func UpdateHelmRepo(c *gin.Context) {
 		ctx.Err = e.ErrInvalidParam.AddDesc("invalid helmRepo json args")
 		return
 	}
-	args.UpdateBy = ctx.Username
+	args.UpdateBy = ctx.UserName
 	ctx.Err = service.UpdateHelmRepo(c.Param("id"), args, ctx.Logger)
 }
 
@@ -70,4 +71,11 @@ func DeleteHelmRepo(c *gin.Context) {
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
 
 	ctx.Err = service.DeleteHelmRepo(c.Param("id"), ctx.Logger)
+}
+
+func ListCharts(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	ctx.Resp, ctx.Err = service.ListCharts(c.Param("name"), ctx.Logger)
 }

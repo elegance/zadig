@@ -47,18 +47,14 @@ type Workflow struct {
 	TestStage       *TestStage         `bson:"test_stage"                   json:"test_stage"`
 	SecurityStage   *SecurityStage     `bson:"security_stage"               json:"security_stage"`
 	DistributeStage *DistributeStage   `bson:"distribute_stage"             json:"distribute_stage"`
+	ExtensionStage  *ExtensionStage    `bson:"extension_stage"              json:"extension_stage"`
 	NotifyCtl       *NotifyCtl         `bson:"notify_ctl,omitempty"         json:"notify_ctl,omitempty"`
 	HookCtl         *WorkflowHookCtrl  `bson:"hook_ctl"                     json:"hook_ctl"`
-	IsFavorite      bool               `bson:"-"                            json:"is_favorite"`
-	LastestTask     *TaskInfo          `bson:"-"                            json:"lastest_task"`
-	LastSucessTask  *TaskInfo          `bson:"-"                            json:"last_task_success"`
-	LastFailureTask *TaskInfo          `bson:"-"                            json:"last_task_failure"`
-	TotalDuration   int64              `bson:"-"                            json:"total_duration"`
-	TotalNum        int                `bson:"-"                            json:"total_num"`
-	TotalSuccess    int                `bson:"-"                            json:"total_success"`
+	BaseName        string             `bson:"base_name" json:"base_name"`
 
 	// ResetImage indicate whether reset image to original version after completion
-	ResetImage bool `json:"reset_image" bson:"reset_image"`
+	ResetImage       bool                         `bson:"reset_image"                  json:"reset_image"`
+	ResetImagePolicy setting.ResetImagePolicyType `bson:"reset_image_policy,omitempty" json:"reset_image_policy,omitempty"`
 	// IsParallel 控制单一工作流的任务是否支持并行处理
 	IsParallel bool `json:"is_parallel" bson:"is_parallel"`
 }
@@ -69,10 +65,12 @@ type WorkflowHookCtrl struct {
 }
 
 type WorkflowHook struct {
-	AutoCancel          bool              `bson:"auto_cancel"             json:"auto_cancel"`
-	CheckPatchSetChange bool              `bson:"check_patch_set_change"  json:"check_patch_set_change"`
-	MainRepo            MainHookRepo      `bson:"main_repo"               json:"main_repo"`
-	WorkflowArgs        *WorkflowTaskArgs `bson:"workflow_args"           json:"workflow_args"`
+	AutoCancel          bool              `bson:"auto_cancel"               json:"auto_cancel"`
+	CheckPatchSetChange bool              `bson:"check_patch_set_change"    json:"check_patch_set_change"`
+	MainRepo            *MainHookRepo     `bson:"main_repo"                 json:"main_repo"`
+	WorkflowArgs        *WorkflowTaskArgs `bson:"workflow_args"             json:"workflow_args"`
+	IsYaml              bool              `bson:"is_yaml,omitempty"         json:"is_yaml,omitempty"`
+	YamlPath            string            `bson:"yaml_path,omitempty"       json:"yaml_path,omitempty"`
 }
 
 type MainHookRepo struct {
@@ -82,11 +80,14 @@ type MainHookRepo struct {
 	RepoOwner    string                 `bson:"repo_owner"                json:"repo_owner"`
 	RepoName     string                 `bson:"repo_name"                 json:"repo_name"`
 	Branch       string                 `bson:"branch"                    json:"branch"`
+	Tag          string                 `bson:"tag"                       json:"tag"`
+	Committer    string                 `bson:"committer"                 json:"committer"`
 	MatchFolders []string               `bson:"match_folders"             json:"match_folders,omitempty"`
 	CodehostID   int                    `bson:"codehost_id"               json:"codehost_id"`
 	Events       []config.HookEventType `bson:"events"                    json:"events"`
 	Label        string                 `bson:"label"                     json:"label"`
 	Revision     string                 `bson:"revision"                  json:"revision"`
+	IsRegular    bool                   `bson:"is_regular"                json:"is_regular"`
 }
 
 func (m MainHookRepo) GetLabelValue() string {
@@ -134,24 +135,30 @@ type TaskArgs struct {
 	CodeHostID     int                 `bson:"codehost_id"             json:"codehost_id"`
 }
 
+type CallbackArgs struct {
+	CallbackUrl  string                 `bson:"callback_url" json:"callback_url"`   // url-encoded full path
+	CallbackVars map[string]interface{} `bson:"callback_vars" json:"callback_vars"` // custom defied vars, will be set to body of callback request
+}
+
 // WorkflowTaskArgs 多服务工作流任务参数
 type WorkflowTaskArgs struct {
 	WorkflowName    string `bson:"workflow_name"                json:"workflow_name"`
 	ProductTmplName string `bson:"product_tmpl_name"            json:"product_tmpl_name"`
 	Description     string `bson:"description,omitempty"        json:"description,omitempty"`
 	//为了兼容老数据，namespace可能会存多个环境名称，用逗号隔开
-	Namespace          string          `bson:"namespace"                    json:"namespace"`
-	BaseNamespace      string          `bson:"base_namespace,omitempty"     json:"base_namespace,omitempty"`
-	EnvRecyclePolicy   string          `bson:"env_recycle_policy,omitempty" json:"env_recycle_policy,omitempty"`
-	EnvUpdatePolicy    string          `bson:"env_update_policy,omitempty"  json:"env_update_policy,omitempty"`
-	Target             []*TargetArgs   `bson:"targets"                      json:"targets"`
-	Artifact           []*ArtifactArgs `bson:"artifact_args"                json:"artifact_args"`
-	Tests              []*TestArgs     `bson:"tests"                        json:"tests"`
-	VersionArgs        *VersionArgs    `bson:"version_args,omitempty"       json:"version_args,omitempty"`
-	ReqID              string          `bson:"req_id"                       json:"req_id"`
-	RegistryID         string          `bson:"registry_id,omitempty"        json:"registry_id,omitempty"`
-	DistributeEnabled  bool            `bson:"distribute_enabled"           json:"distribute_enabled"`
-	WorklowTaskCreator string          `bson:"workflow_task_creator"        json:"workflow_task_creator"`
+	Namespace           string          `bson:"namespace"                    json:"namespace"`
+	BaseNamespace       string          `bson:"base_namespace,omitempty"     json:"base_namespace,omitempty"`
+	EnvRecyclePolicy    string          `bson:"env_recycle_policy,omitempty" json:"env_recycle_policy,omitempty"`
+	EnvUpdatePolicy     string          `bson:"env_update_policy,omitempty"  json:"env_update_policy,omitempty"`
+	Target              []*TargetArgs   `bson:"targets"                      json:"targets"`
+	Artifact            []*ArtifactArgs `bson:"artifact_args"                json:"artifact_args"`
+	Tests               []*TestArgs     `bson:"tests"                        json:"tests"`
+	VersionArgs         *VersionArgs    `bson:"version_args,omitempty"       json:"version_args,omitempty"`
+	ReqID               string          `bson:"req_id"                       json:"req_id"`
+	RegistryID          string          `bson:"registry_id,omitempty"        json:"registry_id,omitempty"`
+	StorageID           string          `bson:"storage_id,omitempty"         json:"storage_id,omitempty"`
+	DistributeEnabled   bool            `bson:"distribute_enabled"           json:"distribute_enabled"`
+	WorkflowTaskCreator string          `bson:"workflow_task_creator"        json:"workflow_task_creator"`
 	// Ignore docker build cache
 	IgnoreCache bool `json:"ignore_cache" bson:"ignore_cache"`
 	// Ignore workspace cache and reset volume
@@ -167,12 +174,22 @@ type WorkflowTaskArgs struct {
 	CodehostID     int    `bson:"codehost_id"      json:"codehost_id"`
 	RepoOwner      string `bson:"repo_owner"       json:"repo_owner"`
 	RepoName       string `bson:"repo_name"        json:"repo_name"`
-
+	Committer      string `bson:"committer,omitempty"        json:"committer,omitempty"`
 	//github check run
 	HookPayload *HookPayload `bson:"hook_payload"            json:"hook_payload,omitempty"`
 	// 请求模式，openAPI表示外部客户调用
 	RequestMode string `json:"request_mode,omitempty"`
 	IsParallel  bool   `json:"is_parallel" bson:"is_parallel"`
+	EnvName     string `json:"env_name" bson:"-"`
+
+	Callback      *CallbackArgs   `bson:"callback"                    json:"callback"`
+	ReleaseImages []*ReleaseImage `bson:"release_images,omitempty"    json:"release_images,omitempty"`
+}
+
+type ReleaseImage struct {
+	Image         string `bson:"image"                    json:"image"`
+	ServiceName   string `bson:"service_name"             json:"service_name"`
+	ServiceModule string `bson:"service_module"           json:"service_module"`
 }
 
 type TestTaskArgs struct {
@@ -204,8 +221,9 @@ type BuildStage struct {
 
 // BuildModule ...
 type BuildModule struct {
-	Target         *ServiceModuleTarget `bson:"target"                 json:"target"`
-	BuildModuleVer string               `bson:"build_module_ver"       json:"build_module_ver"`
+	Target            *ServiceModuleTarget `bson:"target"                 json:"target"`
+	HideServiceModule bool                 `bson:"hide_service_module"    json:"hide_service_module"`
+	BuildModuleVer    string               `bson:"build_module_ver"       json:"build_module_ver"`
 }
 
 type ArtifactStage struct {
@@ -215,7 +233,8 @@ type ArtifactStage struct {
 
 // ArtifactModule ...
 type ArtifactModule struct {
-	Target *ServiceModuleTarget `bson:"target"                 json:"target"`
+	HideServiceModule bool                 `bson:"hide_service_module"    json:"hide_service_module"`
+	Target            *ServiceModuleTarget `bson:"target"                 json:"target"`
 }
 
 type TestStage struct {
@@ -243,6 +262,15 @@ type DistributeStage struct {
 
 	// repos to release images
 	Releases []RepoImage `bson:"releases" json:"releases"`
+}
+
+type ExtensionStage struct {
+	Enabled    bool      `bson:"enabled"              json:"enabled"`
+	URL        string    `bson:"url"                  json:"url"`
+	Path       string    `bson:"path"                 json:"path"`
+	IsCallback bool      `bson:"is_callback"          json:"is_callback"`
+	Timeout    int       `bson:"timeout"              json:"timeout"`
+	Headers    []*KeyVal `bson:"headers"              json:"headers"`
 }
 
 type RepoImage struct {
@@ -313,8 +341,9 @@ type HookPayload struct {
 type TargetArgs struct {
 	Name             string            `bson:"name"                      json:"name"`
 	ServiceName      string            `bson:"service_name"              json:"service_name"`
+	ServiceType      string            `bson:"service_type,omitempty"    json:"service_type,omitempty"`
+	ProductName      string            `bson:"product_name"              json:"product_name"`
 	Build            *BuildArgs        `bson:"build"                     json:"build"`
-	Version          string            `bson:"version"                   json:"version"`
 	Deploy           []DeployEnv       `bson:"deloy"                     json:"deploy"`
 	Image            string            `bson:"image"                     json:"image"`
 	BinFile          string            `bson:"bin_file"                  json:"bin_file"`
@@ -339,10 +368,14 @@ type DeployEnv struct {
 }
 
 type ArtifactArgs struct {
-	Name        string      `bson:"name"                      json:"name"`
-	ServiceName string      `bson:"service_name"              json:"service_name"`
-	Image       string      `bson:"image"                     json:"image"`
-	Deploy      []DeployEnv `bson:"deloy"                     json:"deploy"`
+	Name         string      `bson:"name"                                json:"name"`
+	ServiceName  string      `bson:"service_name"                        json:"service_name"`
+	Image        string      `bson:"image,omitempty"                     json:"image,omitempty"`
+	Deploy       []DeployEnv `bson:"deploy"                              json:"deploy"`
+	WorkflowName string      `bson:"workflow_name,omitempty"             json:"workflow_name,omitempty"`
+	TaskID       int64       `bson:"task_id,omitempty"                   json:"task_id,omitempty"`
+	FileName     string      `bson:"file_name,omitempty"                 json:"file_name,omitempty"`
+	URL          string      `bson:"url,omitempty"                       json:"url,omitempty"`
 }
 
 type VersionArgs struct {
@@ -350,6 +383,20 @@ type VersionArgs struct {
 	Version string   `bson:"version" json:"version"`
 	Desc    string   `bson:"desc"    json:"desc"`
 	Labels  []string `bson:"labels"  json:"labels"`
+}
+
+type BuildModuleArgs struct {
+	BuildName    string
+	Target       string
+	ServiceName  string
+	ProductName  string
+	Variables    []*KeyVal
+	Env          *Product
+	WorkflowName string
+	TaskID       int64
+	FileName     string
+	URL          string
+	TaskType     string
 }
 
 func (Workflow) TableName() string {

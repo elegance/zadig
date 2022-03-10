@@ -32,7 +32,15 @@ type S3Storage struct {
 	EncryptedSk string             `bson:"encryptedSk"    json:"-"`
 	UpdatedBy   string             `bson:"updated_by"     json:"updated_by"`
 	UpdateTime  int64              `bson:"update_time"    json:"update_time"`
-	Provider    int32              `bson:"provider"       json:"provider"`
+	Provider    int8               `bson:"provider"       json:"provider"`
+}
+
+type TarInfo struct {
+	URL          string `bson:"url"                 json:"url"`
+	Name         string `bson:"name"                json:"name"`
+	WorkflowName string `bson:"workflow_name"       json:"workflow_name"`
+	TaskID       int64  `bson:"task_id"             json:"task_id"`
+	FileName     string `bson:"file_name"           json:"file_name"`
 }
 
 func (s S3Storage) TableName() string {

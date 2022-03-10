@@ -17,27 +17,28 @@ limitations under the License.
 package rest
 
 import (
-	"github.com/gin-contrib/sessions"
-	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
 	swaggerfiles "github.com/swaggo/files"
 	ginswagger "github.com/swaggo/gin-swagger"
 
 	buildhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/build/handler"
 	codehosthandler "github.com/koderover/zadig/pkg/microservice/aslan/core/code/handler"
+	collaborationhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/collaboration/handler"
 	commonhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/common/handler"
 	cronhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/cron/handler"
 	deliveryhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/delivery/handler"
 	environmenthandler "github.com/koderover/zadig/pkg/microservice/aslan/core/environment/handler"
+	labelhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/label/handler"
 	loghandler "github.com/koderover/zadig/pkg/microservice/aslan/core/log/handler"
 	multiclusterhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/multicluster/handler"
 	projecthandler "github.com/koderover/zadig/pkg/microservice/aslan/core/project/handler"
 	servicehandler "github.com/koderover/zadig/pkg/microservice/aslan/core/service/handler"
 	settinghandler "github.com/koderover/zadig/pkg/microservice/aslan/core/setting/handler"
+	stathandler "github.com/koderover/zadig/pkg/microservice/aslan/core/stat/handler"
 	systemhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/system/handler"
+	templatehandler "github.com/koderover/zadig/pkg/microservice/aslan/core/templatestore/handler"
 	workflowhandler "github.com/koderover/zadig/pkg/microservice/aslan/core/workflow/handler"
 	testinghandler "github.com/koderover/zadig/pkg/microservice/aslan/core/workflow/testing/handler"
-	gin2 "github.com/koderover/zadig/pkg/middleware/gin"
 
 	// Note: have to load docs for swagger to work. See https://blog.csdn.net/weixin_43249914/article/details/103035711
 	_ "github.com/koderover/zadig/pkg/microservice/aslan/server/rest/doc"
@@ -53,14 +54,6 @@ import (
 // @license.url http://www.apache.org/licenses/LICENSE-2.0.html
 // @BasePath /api/aslan
 func (s *engine) injectRouterGroup(router *gin.RouterGroup) {
-	store := cookie.NewStore([]byte("C12f4d5957k345e9g6e86c117e1bfu5kndjevf8u"))
-	cookieOption := sessions.Options{
-		Path:     "/",
-		HttpOnly: true,
-	}
-	store.Options(cookieOption)
-	router.Use(sessions.Sessions("ASLAN", store))
-	Auth := gin2.Auth()
 	// ---------------------------------------------------------------------------------------
 	// 对外公共接口
 	// ---------------------------------------------------------------------------------------
@@ -71,31 +64,32 @@ func (s *engine) injectRouterGroup(router *gin.RouterGroup) {
 			s.HandleContext(c)
 		})
 		public.GET("/health", commonhandler.Health)
+		public.POST("/callback", commonhandler.HandleCallback)
 	}
 
-	// no auth required, should not be exposed via poetry-api-proxy or will fail
+	// no auth required
 	router.GET("/api/hub/connect", multiclusterhandler.ClusterConnectFromAgent)
 
-	router.GET("/api/kodespace/downloadUrl", Auth, commonhandler.GetToolDownloadURL)
+	router.GET("/api/kodespace/downloadUrl", commonhandler.GetToolDownloadURL)
 
-	jwt := router.Group("/api/token", Auth)
-	{
-		jwt.GET("", commonhandler.GetToken)
-	}
 	for name, r := range map[string]injector{
-		"/api/project":     new(projecthandler.Router),
-		"/api/code":        new(codehosthandler.Router),
-		"/api/system":      new(systemhandler.Router),
-		"/api/service":     new(servicehandler.Router),
-		"/api/setting":     new(settinghandler.Router),
-		"/api/environment": new(environmenthandler.Router),
-		"/api/cron":        new(cronhandler.Router),
-		"/api/workflow":    new(workflowhandler.Router),
-		"/api/build":       new(buildhandler.Router),
-		"/api/delivery":    new(deliveryhandler.Router),
-		"/api/logs":        new(loghandler.Router),
-		"/api/testing":     new(testinghandler.Router),
-		"/api/cluster":     new(multiclusterhandler.Router),
+		"/api/project":       new(projecthandler.Router),
+		"/api/code":          new(codehosthandler.Router),
+		"/api/system":        new(systemhandler.Router),
+		"/api/service":       new(servicehandler.Router),
+		"/api/setting":       new(settinghandler.Router),
+		"/api/environment":   new(environmenthandler.Router),
+		"/api/cron":          new(cronhandler.Router),
+		"/api/workflow":      new(workflowhandler.Router),
+		"/api/build":         new(buildhandler.Router),
+		"/api/delivery":      new(deliveryhandler.Router),
+		"/api/logs":          new(loghandler.Router),
+		"/api/testing":       new(testinghandler.Router),
+		"/api/cluster":       new(multiclusterhandler.Router),
+		"/api/template":      new(templatehandler.Router),
+		"/api/collaboration": new(collaborationhandler.Router),
+		"/api/label":         new(labelhandler.Router),
+		"/api/stat":          new(stathandler.Router),
 	} {
 		r.Inject(router.Group(name))
 	}

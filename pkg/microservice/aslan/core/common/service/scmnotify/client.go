@@ -27,7 +27,7 @@ import (
 
 	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
-	"github.com/koderover/zadig/pkg/shared/codehost"
+	"github.com/koderover/zadig/pkg/shared/client/systemconfig"
 	"github.com/koderover/zadig/pkg/tool/gerrit"
 	gitlabtool "github.com/koderover/zadig/pkg/tool/git/gitlab"
 	"github.com/koderover/zadig/pkg/tool/log"
@@ -55,13 +55,13 @@ func (c *Client) Comment(notify *models.Notification) error {
 		}
 	}
 
-	codeHostDetail, err := codehost.GetCodeHostInfoByID(notify.CodehostID)
+	codeHostDetail, err := systemconfig.New().GetCodeHost(notify.CodehostID)
 	if err != nil {
 		return errors.Wrapf(err, "codehost %d not found to comment", notify.CodehostID)
 	}
 	if strings.ToLower(codeHostDetail.Type) == "gitlab" {
 		var note *gitlab.Note
-		cli, err := gitlabtool.NewClient(codeHostDetail.Address, codeHostDetail.AccessToken)
+		cli, err := gitlabtool.NewClient(codeHostDetail.Address, codeHostDetail.AccessToken, config.ProxyHTTPSAddr(), codeHostDetail.EnableProxy)
 		if err != nil {
 			c.logger.Errorf("create gitlab client failed err: %v", err)
 			return fmt.Errorf("create gitlab client failed err: %v", err)
@@ -90,7 +90,7 @@ func (c *Client) Comment(notify *models.Notification) error {
 			return fmt.Errorf("failed to comment gitlab due to %s/%d %v", notify.ProjectID, notify.PrID, err)
 		}
 	} else if strings.ToLower(codeHostDetail.Type) == gerrit.CodehostTypeGerrit {
-		cli := gerrit.NewClient(codeHostDetail.Address, codeHostDetail.AccessToken)
+		cli := gerrit.NewClient(codeHostDetail.Address, codeHostDetail.AccessToken, config.ProxyHTTPSAddr(), codeHostDetail.EnableProxy)
 		for _, task := range notify.Tasks {
 			// create task created comment
 			if !task.FirstCommented && task.Status == config.TaskStatusReady {

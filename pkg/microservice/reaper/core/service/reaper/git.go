@@ -44,14 +44,17 @@ func (r *Reaper) RunGitGc(folder string) error {
 func (r *Reaper) runGitCmds() error {
 
 	envs := r.getUserEnvs()
-
 	// 如果存在github代码库，则设置代理，同时保证非github库不走代理
 	if r.Ctx.Proxy.EnableRepoProxy && r.Ctx.Proxy.Type == "http" {
 		noProxy := ""
+		proxyFlag := false
 		for _, repo := range r.Ctx.Repos {
-			if repo.Source == meta.ProviderGithub {
-				envs = append(envs, fmt.Sprintf("http_proxy=%s", r.Ctx.Proxy.GetProxyURL()))
-				envs = append(envs, fmt.Sprintf("https_proxy=%s", r.Ctx.Proxy.GetProxyURL()))
+			if repo.EnableProxy {
+				if !proxyFlag {
+					envs = append(envs, fmt.Sprintf("http_proxy=%s", r.Ctx.Proxy.GetProxyURL()))
+					envs = append(envs, fmt.Sprintf("https_proxy=%s", r.Ctx.Proxy.GetProxyURL()))
+					proxyFlag = true
+				}
 			} else {
 				uri, err := url.Parse(repo.Address)
 				if err == nil {
@@ -162,7 +165,14 @@ func (r *Reaper) buildGitCommands(repo *meta.Repo) []*c.Command {
 	}
 
 	// 预防非正常退出导致git被锁住
-	_ = os.Remove(path.Join(workDir, "/.git/index.lock"))
+	indexLockPath := path.Join(workDir, "/.git/index.lock")
+	if err := os.RemoveAll(indexLockPath); err != nil {
+		log.Errorf("Failed to remove %s: %s", indexLockPath, err)
+	}
+	shallowLockPath := path.Join(workDir, "/.git/shallow.lock")
+	if err := os.RemoveAll(shallowLockPath); err != nil {
+		log.Errorf("Failed to remove %s: %s", shallowLockPath, err)
+	}
 
 	if isDirEmpty(filepath.Join(workDir, ".git")) {
 		cmds = append(cmds, &c.Command{Cmd: c.InitGit(workDir)})

@@ -23,29 +23,47 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
+	"github.com/koderover/zadig/pkg/setting"
 	mongotool "github.com/koderover/zadig/pkg/tool/mongo"
 )
 
 type ProductFindOptions struct {
-	Name    string
-	EnvName string
+	Name      string
+	EnvName   string
+	Namespace string
 }
 
 // ClusterId is a primitive.ObjectID{}.Hex()
 type ProductListOptions struct {
-	EnvName       string
-	Name          string
-	IsPublic      bool
-	ClusterID     string
-	IsSort        bool
-	ExcludeStatus string
-	ExcludeSource string
-	Source        string
+	EnvName             string
+	Name                string
+	IsPublic            bool
+	ClusterID           string
+	IsSortByUpdateTime  bool
+	IsSortByProductName bool
+	ExcludeStatus       string
+	ExcludeSource       string
+	Source              string
+	InProjects          []string
+	InEnvs              []string
+	InIDs               []string
+}
+
+type projectEnvs struct {
+	ID          projectID `bson:"_id"`
+	ProjectName string    `bson:"project_name"`
+	Envs        []string  `bson:"envs"`
+}
+
+type projectID struct {
+	ProductName string `bson:"product_name"`
 }
 
 type ProductColl struct {
@@ -116,17 +134,73 @@ func (c *ProductColl) Find(opt *ProductFindOptions) (*models.Product, error) {
 	if opt.EnvName != "" {
 		query["env_name"] = opt.EnvName
 	}
+	if opt.Namespace != "" {
+		query["namespace"] = opt.Namespace
+	}
 
 	err := c.FindOne(context.TODO(), query).Decode(res)
 	return res, err
+}
+
+func (c *ProductColl) EnvCount() (int64, error) {
+	query := bson.M{"status": bson.M{"$ne": setting.ProductStatusDeleting}}
+
+	ctx := context.Background()
+	count, err := c.Collection.CountDocuments(ctx, query)
+	if err != nil {
+		return 0, err
+	}
+
+	return count, nil
+}
+
+type Product struct {
+	Name        string `json:"name"`
+	ProjectName string `json:"projectName"`
+}
+
+type ListProductOpt struct {
+	Products []Product
+}
+
+func (c *ProductColl) ListByProducts(opt ListProductOpt) ([]*models.Product, error) {
+	var res []*models.Product
+
+	if len(opt.Products) == 0 {
+		return nil, nil
+	}
+	condition := bson.A{}
+	for _, pro := range opt.Products {
+		condition = append(condition, bson.M{
+			"env_name":     pro.Name,
+			"product_name": pro.ProjectName,
+		})
+	}
+	filter := bson.D{{"$or", condition}}
+	cursor, err := c.Collection.Find(context.TODO(), filter)
+	if err == mongo.ErrNoDocuments {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := cursor.All(context.TODO(), &res); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 func (c *ProductColl) List(opt *ProductListOptions) ([]*models.Product, error) {
 	var ret []*models.Product
 	query := bson.M{}
 
+	if opt == nil {
+		opt = &ProductListOptions{}
+	}
 	if opt.EnvName != "" {
 		query["env_name"] = opt.EnvName
+	} else if len(opt.InEnvs) > 0 {
+		query["env_name"] = bson.M{"$in": opt.InEnvs}
 	}
 	if opt.Name != "" {
 		query["product_name"] = opt.Name
@@ -146,11 +220,28 @@ func (c *ProductColl) List(opt *ProductListOptions) ([]*models.Product, error) {
 	if opt.ExcludeStatus != "" {
 		query["status"] = bson.M{"$ne": opt.ExcludeStatus}
 	}
+	if len(opt.InProjects) > 0 {
+		query["product_name"] = bson.M{"$in": opt.InProjects}
+	}
+	if len(opt.InIDs) > 0 {
+		var oids []primitive.ObjectID
+		for _, id := range opt.InIDs {
+			oid, err := primitive.ObjectIDFromHex(id)
+			if err != nil {
+				return nil, err
+			}
+			oids = append(oids, oid)
+		}
+		query["_id"] = bson.M{"$in": oids}
+	}
 
 	ctx := context.Background()
 	opts := options.Find()
-	if opt.IsSort {
+	if opt.IsSortByUpdateTime {
 		opts.SetSort(bson.D{{"update_time", -1}})
+	}
+	if opt.IsSortByProductName {
+		opts.SetSort(bson.D{{"product_name", 1}})
 	}
 	cursor, err := c.Collection.Find(ctx, query, opts)
 	if err != nil {
@@ -163,6 +254,37 @@ func (c *ProductColl) List(opt *ProductListOptions) ([]*models.Product, error) {
 	}
 
 	return ret, nil
+}
+
+func (c *ProductColl) ListProjectsInNames(names []string) ([]*projectEnvs, error) {
+	var res []*projectEnvs
+	var pipeline []bson.M
+	if len(names) > 0 {
+		pipeline = append(pipeline, bson.M{"$match": bson.M{"product_name": bson.M{"$in": names}}})
+	}
+
+	pipeline = append(pipeline,
+		bson.M{
+			"$group": bson.M{
+				"_id": bson.M{
+					"product_name": "$product_name",
+				},
+				"project_name": bson.M{"$last": "$product_name"},
+				"envs":         bson.M{"$push": "$env_name"},
+			},
+		},
+	)
+
+	cursor, err := c.Aggregate(context.TODO(), pipeline)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = cursor.All(context.TODO(), &res); err != nil {
+		return nil, err
+	}
+
+	return res, nil
 }
 
 func (c *ProductColl) UpdateStatus(owner, productName, status string) error {
@@ -179,6 +301,16 @@ func (c *ProductColl) UpdateErrors(owner, productName, errorMsg string) error {
 	query := bson.M{"env_name": owner, "product_name": productName}
 	change := bson.M{"$set": bson.M{
 		"error": errorMsg,
+	}}
+	_, err := c.UpdateOne(context.TODO(), query, change)
+
+	return err
+}
+
+func (c *ProductColl) UpdateRegistry(envName, productName, registryId string) error {
+	query := bson.M{"env_name": envName, "product_name": productName}
+	change := bson.M{"$set": bson.M{
+		"registry_id": registryId,
 	}}
 	_, err := c.UpdateOne(context.TODO(), query, change)
 
@@ -269,4 +401,60 @@ func (c *ProductColl) UpdateIsPublic(envName, productName string, isPublic bool)
 	_, err := c.UpdateOne(context.TODO(), query, change)
 
 	return err
+}
+
+func (c *ProductColl) Count(productName string) (int, error) {
+	num, err := c.CountDocuments(context.TODO(), bson.M{"product_name": productName, "status": bson.M{"$ne": setting.ProductStatusDeleting}})
+
+	return int(num), err
+}
+
+// UpdateAll updates all envs in a bulk write.
+// Currently only field `services` is supported.
+// Note: A bulk operation can have at most 1000 operations, but the client will do it for us.
+// see https://stackoverflow.com/questions/24237887/what-is-mongodb-batch-operation-max-size
+func (c *ProductColl) UpdateAll(envs []*models.Product) error {
+	if len(envs) == 0 {
+		return nil
+	}
+
+	var ms []mongo.WriteModel
+	for _, env := range envs {
+		ms = append(ms,
+			mongo.NewUpdateOneModel().
+				SetFilter(bson.D{{"_id", env.ID}}).
+				SetUpdate(bson.D{{"$set", bson.D{{"services", env.Services}}}}),
+		)
+	}
+	_, err := c.BulkWrite(context.TODO(), ms)
+
+	return err
+}
+
+type nsObject struct {
+	ID        primitive.ObjectID `bson:"_id"`
+	Namespace string             `bson:"namespace"`
+}
+
+func (c *ProductColl) ListExistedNamespace() ([]string, error) {
+	nsList := make([]*nsObject, 0)
+	resp := sets.NewString()
+	selector := bson.D{
+		{"namespace", 1},
+	}
+	query := bson.M{"is_existed": true}
+	opt := options.Find()
+	opt.SetProjection(selector)
+	cursor, err := c.Collection.Find(context.TODO(), query, opt)
+	if err != nil {
+		return nil, err
+	}
+	err = cursor.All(context.TODO(), &nsList)
+	if err != nil {
+		return nil, err
+	}
+	for _, obj := range nsList {
+		resp.Insert(obj.Namespace)
+	}
+	return resp.List(), nil
 }

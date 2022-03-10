@@ -19,6 +19,8 @@ package gitlab
 import (
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 
 	"github.com/xanzy/go-gitlab"
 
@@ -43,8 +45,20 @@ type Client struct {
 	*gitlab.Client
 }
 
-func NewClient(address, accessToken string) (*Client, error) {
-	cli, err := gitlab.NewOAuthClient(accessToken, gitlab.WithBaseURL(address))
+func NewClient(address, accessToken, proxyAddr string, enableProxy bool) (*Client, error) {
+	var client *http.Client
+	if enableProxy {
+		proxyURL, err := url.Parse(proxyAddr)
+		if err != nil {
+			return nil, err
+		}
+		transport := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+		client = &http.Client{Transport: transport}
+	} else {
+		client = http.DefaultClient
+	}
+
+	cli, err := gitlab.NewOAuthClient(accessToken, gitlab.WithBaseURL(address), gitlab.WithHTTPClient(client))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gitlab client, err: %s", err)
 	}
@@ -95,7 +109,7 @@ func wrap(obj interface{}, res *gitlab.Response, err error) (interface{}, error)
 }
 
 func wrapError(res *gitlab.Response, err error) error {
-	if err != nil {
+	if res == nil && err != nil {
 		return err
 	}
 
@@ -103,6 +117,5 @@ func wrapError(res *gitlab.Response, err error) error {
 		body, _ := io.ReadAll(res.Body)
 		return httpclient.NewGenericServerResponse(res.StatusCode, res.Request.Method, string(body))
 	}
-
 	return nil
 }

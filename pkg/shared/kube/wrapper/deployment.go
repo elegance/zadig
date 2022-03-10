@@ -66,3 +66,29 @@ func (w *deployment) WorkloadResource(pods []*corev1.Pod) *resource.Workload {
 
 	return wl
 }
+
+func (w *deployment) Images() (images []string) {
+	for _, v := range w.Spec.Template.Spec.Containers {
+		images = append(images, v.Name)
+	}
+	return
+}
+
+func (w *deployment) ImageInfos() (images []string) {
+	for _, v := range w.Spec.Template.Spec.Containers {
+		images = append(images, v.Image)
+	}
+	return
+}
+
+func (w *deployment) GetKind() string {
+	return w.Kind
+}
+
+func (w *deployment) GetContainers() []*resource.ContainerImage {
+	containers := make([]*resource.ContainerImage, 0, len(w.Spec.Template.Spec.Containers))
+	for _, c := range w.Spec.Template.Spec.Containers {
+		containers = append(containers, &resource.ContainerImage{Name: c.Name, Image: c.Image})
+	}
+	return containers
+}

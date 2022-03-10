@@ -17,80 +17,142 @@ limitations under the License.
 package handler
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"reflect"
+	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt"
 	"go.uber.org/zap"
 
-	"github.com/koderover/zadig/pkg/config"
+	systemmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/system/repository/models"
+	systemservice "github.com/koderover/zadig/pkg/microservice/aslan/core/system/service"
 	"github.com/koderover/zadig/pkg/setting"
-	"github.com/koderover/zadig/pkg/shared/client/aslanx"
-	"github.com/koderover/zadig/pkg/shared/poetry"
-	e "github.com/koderover/zadig/pkg/tool/errors"
-	"github.com/koderover/zadig/pkg/types/permission"
 	"github.com/koderover/zadig/pkg/util/ginzap"
 )
 
 // Context struct
 type Context struct {
-	Logger    *zap.SugaredLogger
-	Err       error
-	Resp      interface{}
-	Username  string
-	User      *permission.User
-	RequestID string
+	Logger       *zap.SugaredLogger
+	Err          error
+	Resp         interface{}
+	Account      string
+	UserName     string
+	UserID       string
+	IdentityType string
+	RequestID    string
 }
 
+type jwtClaims struct {
+	Name            string          `json:"name"`
+	Email           string          `json:"email"`
+	UID             string          `json:"uid"`
+	Account         string          `json:"preferred_username"`
+	FederatedClaims FederatedClaims `json:"federated_claims"`
+	jwt.StandardClaims
+}
+
+type FederatedClaims struct {
+	ConnectorId string `json:"connector_id"`
+	UserId      string `json:"user_id"`
+}
+
+// TODO: We need to implement a `context.Context` that conforms to the golang standard library.
 func NewContext(c *gin.Context) *Context {
+	logger := ginzap.WithContext(c).Sugar()
+	var claims jwtClaims
+
+	token := c.GetHeader(setting.AuthorizationHeader)
+	if len(token) > 0 {
+		var err error
+		claims, err = getUserFromJWT(token)
+		if err != nil {
+			logger.Warnf("Failed to get user from token, err: %s", err)
+		}
+	}
+
 	return &Context{
-		Username:  currentUsername(c),
-		User:      currentUser(c),
-		Logger:    ginzap.WithContext(c).Sugar(),
-		RequestID: c.GetString(setting.RequestID),
+		UserName:     claims.Name,
+		UserID:       claims.UID,
+		Account:      claims.Account,
+		IdentityType: claims.FederatedClaims.ConnectorId,
+		Logger:       ginzap.WithContext(c).Sugar(),
+		RequestID:    c.GetString(setting.RequestID),
 	}
 }
 
-// CurrentUser return current session user
-func currentUser(c *gin.Context) *permission.User {
-	userInfo, isExist := c.Get(setting.SessionUser)
-	user, ok := userInfo.(*poetry.UserInfo)
-	if isExist && ok {
-		return poetry.ConvertUserInfo(user)
+func GetResourcesInHeader(c *gin.Context) ([]string, bool) {
+	_, ok := c.Request.Header[setting.ResourcesHeader]
+	if !ok {
+		return nil, false
 	}
-	return permission.AnonymousUser
+
+	res := c.GetHeader(setting.ResourcesHeader)
+	if res == "" {
+		return nil, true
+	}
+	var resources []string
+	if err := json.Unmarshal([]byte(res), &resources); err != nil {
+		return nil, false
+	}
+
+	return resources, true
 }
 
-func currentUsername(c *gin.Context) (username string) {
-	return c.GetString(setting.SessionUsername)
+func getUserFromJWT(token string) (jwtClaims, error) {
+	cs := jwtClaims{}
+
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return cs, fmt.Errorf("compact JWS format must have three parts")
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return cs, err
+	}
+
+	err = json.Unmarshal(payload, &cs)
+	if err != nil {
+		return cs, err
+	}
+
+	return cs, nil
 }
 
 func JSONResponse(c *gin.Context, ctx *Context) {
 	if ctx.Err != nil {
-		c.JSON(e.ErrorMessage(ctx.Err))
+		c.Set(setting.ResponseError, ctx.Err)
 		c.Abort()
 		return
 	}
 
-	realResp := responseHelper(ctx.Resp)
-
-	if ctx.Resp == nil {
-		c.JSON(200, gin.H{"message": "success"})
-	} else {
-		c.JSON(200, realResp)
+	if ctx.Resp != nil {
+		realResp := responseHelper(ctx.Resp)
+		c.Set(setting.ResponseData, realResp)
 	}
 }
 
 // InsertOperationLog 插入操作日志
-func InsertOperationLog(c *gin.Context, username, productName, method, function, detail, permissionUUID, requestBody string, logger *zap.SugaredLogger) {
-	if !config.Enterprise() {
-		return
+func InsertOperationLog(c *gin.Context, username, productName, method, function, detail, requestBody string, logger *zap.SugaredLogger) {
+	req := &systemmodels.OperationLog{
+		Username:    username,
+		ProductName: productName,
+		Method:      method,
+		Function:    function,
+		Name:        detail,
+		RequestBody: requestBody,
+		Status:      0,
+		CreatedAt:   time.Now().Unix(),
 	}
-
-	operationLogID, err := aslanx.New(config.AslanxServiceAddress(), config.PoetryAPIRootKey()).AddAuditLog(username, productName, method, function, detail, permissionUUID, requestBody, logger)
+	operationLogID, err := systemservice.InsertOperation(req, logger)
 	if err != nil {
 		logger.Errorf("InsertOperation err:%v", err)
 	}
-	c.Set("operationLogID", operationLogID)
+	c.Set("operationLogID", operationLogID.OperationLogID)
 }
 
 // responseHelper recursively finds all nil slice in the given interface,
@@ -100,6 +162,11 @@ func InsertOperationLog(c *gin.Context, username, productName, method, function,
 //    pointer a passed in, a pointer will be returned, not a double pointer
 // 2. All private fields of the struct will be deleted during the process.
 func responseHelper(response interface{}) interface{} {
+	switch response.(type) {
+	case string, []byte:
+		return response
+	}
+
 	val := reflect.ValueOf(response)
 	switch val.Kind() {
 	case reflect.Ptr:

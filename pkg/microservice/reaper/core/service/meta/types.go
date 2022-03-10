@@ -24,13 +24,17 @@ import (
 	"strings"
 
 	"github.com/koderover/zadig/pkg/microservice/reaper/config"
+	"github.com/koderover/zadig/pkg/setting"
+	"github.com/koderover/zadig/pkg/types"
 )
 
-// Context ...
 type Context struct {
+	// API token 服务访问使用的api token
+	APIToken string `yaml:"api_token"`
 	// Workspace 容器工作目录 [必填]
 	Workspace string `yaml:"workspace"`
 
+	// TODO: Deprecated.
 	// CleanWorkspace 是否清理工作目录 [选填, 默认为 false]
 	CleanWorkspace bool `yaml:"clean_workspace"`
 
@@ -82,6 +86,7 @@ type Context struct {
 	// Git Github/Gitlab 配置
 	Git *Git `yaml:"git"`
 
+	// TODO: Deprecated.
 	// Caches Caches配置
 	Caches []string `yaml:"caches"`
 
@@ -106,10 +111,27 @@ type Context struct {
 	// IgnoreCache ignore docker build cache [runtime]
 	IgnoreCache bool `yaml:"ignore_cache"`
 
-	StorageEndpoint string `yaml:"storage_endpoint"`
-	StorageAK       string `yaml:"storage_ak"`
-	StorageSK       string `yaml:"storage_sk"`
-	StorageBucket   string `yaml:"storage_bucket"`
+	StorageEndpoint string        `yaml:"storage_endpoint"`
+	StorageAK       string        `yaml:"storage_ak"`
+	StorageSK       string        `yaml:"storage_sk"`
+	StorageBucket   string        `yaml:"storage_bucket"`
+	StorageProvider int           `yaml:"storage_provider"`
+	ArtifactInfo    *ArtifactInfo `yaml:"artifact_info"`
+	ArtifactPath    string        `yaml:"artifact_path"`
+	AesKey          string        `yaml:"aes_key"`
+
+	// New since V1.10.0.
+	CacheEnable  bool               `yaml:"cache_enable"`
+	Cache        types.Cache        `yaml:"cache"`
+	CacheDirType types.CacheDirType `yaml:"cache_dir_type"`
+	CacheUserDir string             `yaml:"cache_user_dir"`
+}
+
+type ArtifactInfo struct {
+	URL          string `yaml:"url"`
+	WorkflowName string `yaml:"workflow_name"`
+	TaskID       int64  `yaml:"task_id"`
+	FileName     string `yaml:"file_name"`
 }
 
 // DockerBuildCtx ...
@@ -118,14 +140,20 @@ type Context struct {
 // DockerFile: dockerfile名称, 默认为Dockerfile
 // ImageBuild: build image镜像全称, e.g. xxx.com/spock-release-candidates/image:tag
 type DockerBuildCtx struct {
-	WorkDir         string `yaml:"work_dir" bson:"work_dir" json:"work_dir"`
-	DockerFile      string `yaml:"docker_file" bson:"docker_file" json:"docker_file"`
-	ImageName       string `yaml:"image_name" bson:"image_name" json:"image_name"`
-	BuildArgs       string `yaml:"build_args" bson:"build_args" json:"build_args"`
-	ImageReleaseTag string `yaml:"image_release_tag,omitempty" bson:"image_release_tag,omitempty" json:"image_release_tag"`
+	Source                string `yaml:"source"      bson:"source"      json:"source"`
+	WorkDir               string `yaml:"work_dir"    bson:"work_dir"    json:"work_dir"`
+	DockerFile            string `yaml:"docker_file" bson:"docker_file" json:"docker_file"`
+	ImageName             string `yaml:"image_name"  bson:"image_name"  json:"image_name"`
+	BuildArgs             string `yaml:"build_args"  bson:"build_args"  json:"build_args"`
+	ImageReleaseTag       string `yaml:"image_release_tag,omitempty" bson:"image_release_tag,omitempty" json:"image_release_tag"`
+	DockerTemplateContent string `yaml:"docker_template_content" bson:"docker_template_content" json:"docker_template_content"`
 }
 
 func (c *DockerBuildCtx) GetDockerFile() string {
+	// if the source of the dockerfile is from template, we write our own dockerfile
+	if c.Source == setting.DockerfileSourceTemplate {
+		return fmt.Sprintf("/%s", setting.ZadigDockerfilePath)
+	}
 	if c.DockerFile == "" {
 		return "Dockerfile"
 	}
@@ -235,6 +263,7 @@ type Repo struct {
 	User         string `yaml:"username"`
 	Password     string `yaml:"password"`
 	CheckoutRef  string `yaml:"checkout_ref"`
+	EnableProxy  bool   `yaml:"enable_proxy"`
 }
 
 // PRRef returns refs format
@@ -243,7 +272,7 @@ type Repo struct {
 // e.g. github returns refs/pull/1/head
 // e.g. gitlab returns merge-requests/1/head
 func (r *Repo) PRRef() string {
-	if strings.ToLower(r.Source) == ProviderGitlab {
+	if strings.ToLower(r.Source) == ProviderGitlab || strings.ToLower(r.Source) == ProviderCodehub {
 		return fmt.Sprintf("merge-requests/%d/head", r.PR)
 	} else if strings.ToLower(r.Source) == ProviderGerrit {
 		return r.CheckoutRef

@@ -16,6 +16,12 @@ limitations under the License.
 
 package models
 
+import (
+	templatemodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models/template"
+)
+
+// TODO: move Revision out of Service.
+
 // Service : service template struct
 // Service template config has 3 types mainly.
 // 1. Kubernetes service, and yaml+config is held in aslan: type == "k8s"; source == "spock"; yaml != ""
@@ -48,13 +54,41 @@ type Service struct {
 	HelmChart        *HelmChart       `bson:"helm_chart,omitempty"           json:"helm_chart,omitempty"`
 	EnvConfigs       []*EnvConfig     `bson:"env_configs,omitempty"          json:"env_configs,omitempty"`
 	EnvStatuses      []*EnvStatus     `bson:"env_statuses,omitempty"         json:"env_statuses,omitempty"`
-	CodehostID       int              `bson:"codehost_id"                    json:"codehost_id"`
-	RepoOwner        string           `bson:"repo_owner"                     json:"repo_owner"`
-	RepoName         string           `bson:"repo_name"                      json:"repo_name"`
-	BranchName       string           `bson:"branch_name"                    json:"branch_name"`
-	LoadPath         string           `bson:"load_path"                      json:"load_path"`
-	LoadFromDir      bool             `bson:"is_dir"                         json:"is_dir"`
+	CodehostID       int              `bson:"codehost_id,omitempty"          json:"codehost_id,omitempty"`
+	RepoOwner        string           `bson:"repo_owner,omitempty"           json:"repo_owner,omitempty"`
+	RepoName         string           `bson:"repo_name,omitempty"            json:"repo_name,omitempty"`
+	RepoUUID         string           `bson:"repo_uuid,omitempty"            json:"repo_uuid,omitempty"`
+	BranchName       string           `bson:"branch_name,omitempty"          json:"branch_name,omitempty"`
+	LoadPath         string           `bson:"load_path,omitempty"            json:"load_path,omitempty"`
+	LoadFromDir      bool             `bson:"is_dir,omitempty"               json:"is_dir,omitempty"`
+	CreateFrom       interface{}      `bson:"create_from,omitempty"               json:"create_from,omitempty"`
 	HealthChecks     []*PmHealthCheck `bson:"health_checks,omitempty"        json:"health_checks,omitempty"`
+	WorkloadType     string           `bson:"workload_type,omitempty"        json:"workload_type,omitempty"`
+	EnvName          string           `bson:"env_name,omitempty"             json:"env_name,omitempty"`
+	TemplateID       string           `bson:"template_id,omitempty"          json:"template_id,omitempty"`
+}
+
+type CreateFromRepo struct {
+	GitRepoConfig *templatemodels.GitRepoConfig `bson:"git_repo_config,omitempty"            json:"git_repo_config,omitempty"`
+	LoadPath      string                        `bson:"load_path,omitempty"            json:"load_path,omitempty"`
+}
+
+type CreateFromPublicRepo struct {
+	RepoLink string `bson:"repo_link" json:"repo_link"`
+	LoadPath string `bson:"load_path,omitempty"        json:"load_path,omitempty"`
+}
+
+type CreateFromChartTemplate struct {
+	YamlData     *templatemodels.CustomYaml `bson:"yaml_data,omitempty"   json:"yaml_data,omitempty"`
+	TemplateName string                     `bson:"template_name" json:"template_name"`
+	ServiceName  string                     `bson:"service_name" json:"service_name"`
+	Variables    []*Variable                `bson:"variables" json:"variables"`
+}
+
+type CreateFromChartRepo struct {
+	ChartRepoName string `json:"chart_repo_name" bson:"chart_repo_name"`
+	ChartName     string `json:"chart_name"      bson:"chart_name"`
+	ChartVersion  string `json:"chart_version"   bson:"chart_version"`
 }
 
 type GUIConfig struct {
@@ -87,10 +121,18 @@ type Commit struct {
 	Message string `bson:"message"          json:"message"`
 }
 
+// ImagePathSpec paths in yaml used to parse image
+type ImagePathSpec struct {
+	Repo  string `bson:"repo,omitempty"           json:"repo,omitempty"`
+	Image string `bson:"image,omitempty"           json:"image,omitempty"`
+	Tag   string `bson:"tag,omitempty"           json:"tag,omitempty"`
+}
+
 // Container ...
 type Container struct {
-	Name  string `bson:"name"           json:"name"`
-	Image string `bson:"image"          json:"image"`
+	Name      string         `bson:"name"           json:"name"`
+	Image     string         `bson:"image"          json:"image"`
+	ImagePath *ImagePathSpec `bson:"image_path,omitempty"          json:"imagePath,omitempty"`
 }
 
 // ServiceTmplPipeResp ...router
@@ -104,6 +146,7 @@ type ServiceTmplPipeResp struct {
 	CodehostID       int                 `bson:"codehost_id"                    json:"codehost_id"`
 	RepoOwner        string              `bson:"repo_owner"                     json:"repo_owner"`
 	RepoName         string              `bson:"repo_name"                      json:"repo_name"`
+	RepoUUID         string              `bson:"repo_uuid"                      json:"repo_uuid"`
 	BranchName       string              `bson:"branch_name"                    json:"branch_name"`
 	LoadPath         string              `bson:"load_path"                      json:"load_path"`
 	LoadFromDir      bool                `bson:"is_dir"                         json:"is_dir"`
@@ -186,6 +229,7 @@ type EnvStatus struct {
 type EnvConfig struct {
 	EnvName string   `bson:"env_name,omitempty" json:"env_name"`
 	HostIDs []string `bson:"host_ids,omitempty" json:"host_ids"`
+	Labels  []string `bson:"labels,omitempty"   json:"labels"`
 }
 
 type PmHealthCheck struct {

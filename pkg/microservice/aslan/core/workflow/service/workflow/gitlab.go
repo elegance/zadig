@@ -19,13 +19,17 @@ package workflow
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"sort"
 	"time"
 
+	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	"github.com/xanzy/go-gitlab"
+	"go.uber.org/zap"
 
 	"github.com/koderover/zadig/pkg/setting"
-	"github.com/koderover/zadig/pkg/shared/codehost"
+	"github.com/koderover/zadig/pkg/shared/client/systemconfig"
 	"github.com/koderover/zadig/pkg/tool/gerrit"
 )
 
@@ -38,19 +42,26 @@ type RepoCommit struct {
 	Message    string     `json:"message"`
 }
 
-func QueryByBranch(id int, owner string, name string, branch string) (*RepoCommit, error) {
-	opt := &codehost.Option{
-		CodeHostID: id,
-	}
-	ch, err := codehost.GetCodeHostInfo(opt)
+func QueryByBranch(id int, owner, name, branch string, log *zap.SugaredLogger) (*RepoCommit, error) {
+	ch, err := systemconfig.New().GetCodeHost(id)
 	if err != nil {
 		return nil, err
 	}
 
 	if ch.Type == setting.SourceFromGitlab {
 		token, address := ch.AccessToken, ch.Address
-
-		cli, err := gitlab.NewOAuthClient(token, gitlab.WithBaseURL(address))
+		var client *http.Client
+		if ch.EnableProxy {
+			proxyURL, err := url.Parse(config.ProxyHTTPSAddr())
+			if err != nil {
+				return nil, err
+			}
+			transport := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
+			client = &http.Client{Transport: transport}
+		} else {
+			client = http.DefaultClient
+		}
+		cli, err := gitlab.NewOAuthClient(token, gitlab.WithBaseURL(address), gitlab.WithHTTPClient(client))
 		if err != nil {
 			return nil, fmt.Errorf("set base url failed, err:%v", err)
 		}
@@ -68,7 +79,7 @@ func QueryByBranch(id int, owner string, name string, branch string) (*RepoCommi
 			Message:    br.Commit.Message,
 		}, nil
 	} else if ch.Type == setting.SourceFromGerrit {
-		cli := gerrit.NewClient(ch.Address, ch.AccessToken)
+		cli := gerrit.NewClient(ch.Address, ch.AccessToken, config.ProxyHTTPSAddr(), ch.EnableProxy)
 		commit, err := cli.GetCommitByBranch(name, branch)
 		if err != nil {
 			return nil, err
@@ -88,11 +99,8 @@ func QueryByBranch(id int, owner string, name string, branch string) (*RepoCommi
 	return nil, errors.New(ch.Type + "is not supported yet")
 }
 
-func QueryByTag(id int, owner string, name string, tag string) (*RepoCommit, error) {
-	opt := &codehost.Option{
-		CodeHostID: id,
-	}
-	ch, err := codehost.GetCodeHostInfo(opt)
+func QueryByTag(id int, owner, name, tag string, log *zap.SugaredLogger) (*RepoCommit, error) {
+	ch, err := systemconfig.New().GetCodeHost(id)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +126,7 @@ func QueryByTag(id int, owner string, name string, tag string) (*RepoCommit, err
 			Message:    br.Commit.Message,
 		}, nil
 	} else if ch.Type == setting.SourceFromGerrit {
-		cli := gerrit.NewClient(ch.Address, ch.AccessToken)
+		cli := gerrit.NewClient(ch.Address, ch.AccessToken, config.ProxyHTTPSAddr(), ch.EnableProxy)
 		commit, err := cli.GetCommitByTag(name, tag)
 		if err != nil {
 			return nil, err
@@ -146,17 +154,10 @@ type PRCommit struct {
 	CheckoutRef string     `json:"checkout_ref"`
 }
 
-func GetLatestPrCommit(codehostID, pr int, namespace, projectName string) (*PRCommit, error) {
+func GetLatestPrCommit(codehostID, pr int, namespace, projectName string, log *zap.SugaredLogger) (*PRCommit, error) {
 	projectID := fmt.Sprintf("%s/%s", namespace, projectName)
-	//codehost, err := s.client.dir.Codehosts.GetCodehostDetial(codehostId)
-	//if err != nil {
-	//	return nil, err
-	//}
 
-	opt := &codehost.Option{
-		CodeHostID: codehostID,
-	}
-	ch, err := codehost.GetCodeHostInfo(opt)
+	ch, err := systemconfig.New().GetCodeHost(codehostID)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +169,7 @@ func GetLatestPrCommit(codehostID, pr int, namespace, projectName string) (*PRCo
 	}
 
 	if ch.Type == gerrit.CodehostTypeGerrit {
-		cli := gerrit.NewClient(ch.Address, ch.AccessToken)
+		cli := gerrit.NewClient(ch.Address, ch.AccessToken, config.ProxyHTTPSAddr(), ch.EnableProxy)
 		change, err := cli.GetCurrentVersionByChangeID(projectName, pr)
 		if err != nil {
 			return nil, err

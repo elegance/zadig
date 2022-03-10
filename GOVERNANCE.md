@@ -56,5 +56,16 @@ The council will make a decision for the nomination. The candidate has to have d
 - [piao100101](https://github.com/piao100101)
 - [nanzm](https://github.com/nanzm)
 - [solomon-cc](https://github.com/solomon-cc)
-
-
+- [lesterhnu](https://github.com/lesterhnu)
+- [liuflylove666](https://github.com/liuflylove666)
+- [jiangpeipei327](https://github.com/jiangpeipei327)
+- [lyzhang1999](https://github.com/lyzhang1999)
+- [avtion](https://github.com/avtion)
+- [wbjxxzx](https://github.com/wbjxxzx)
+- [jtr109](https://github.com/jtr109)
+- [huangzexiong](https://github.com/huangzexiong)
+- [ruchikabobade](https://github.com/ruchikabobade)
+- [fengzixu](https://github.com/fengzixu)
+- [xrfinbupt](https://github.com/xrfinbupt)
+- [mhatvan](https://github.com/mhatvan)
+- [tbbrave](https://github.com/tbbrave)

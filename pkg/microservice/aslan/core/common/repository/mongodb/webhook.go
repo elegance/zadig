@@ -118,3 +118,40 @@ func (c *WebHookColl) Delete(owner, repo, address string) error {
 
 	return nil
 }
+
+func (c *WebHookColl) List() ([]*models.WebHook, error) {
+	res := make([]*models.WebHook, 0)
+	cursor, err := c.Collection.Find(context.TODO(), bson.M{})
+	if err != nil {
+		return nil, err
+	}
+	err = cursor.All(context.TODO(), &res)
+	if err != nil {
+		return nil, err
+	}
+
+	return res, err
+}
+
+// Find find webhook
+func (c *WebHookColl) Find(owner, repo, address string) (*models.WebHook, error) {
+	query := bson.M{"owner": owner, "repo": repo, "address": address}
+	webhook := new(models.WebHook)
+	err := c.FindOne(context.TODO(), query).Decode(webhook)
+	return webhook, err
+}
+
+// Update update hookID
+func (c *WebHookColl) Update(owner, repo, address, hookID string) error {
+	query := bson.M{"owner": owner, "repo": repo, "address": address}
+	change := bson.M{"$set": bson.M{
+		"hook_id": hookID,
+	}}
+
+	_, err := c.UpdateOne(context.TODO(), query, change)
+	return err
+}
+
+func IsErrNoDocuments(err error) bool {
+	return err == mongo.ErrNoDocuments
+}

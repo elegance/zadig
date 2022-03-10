@@ -27,15 +27,16 @@ import (
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb/template"
+	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/collaboration"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/gerrit"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/webhook"
 	"github.com/koderover/zadig/pkg/setting"
-	"github.com/koderover/zadig/pkg/shared/codehost"
+	"github.com/koderover/zadig/pkg/shared/client/systemconfig"
 	e "github.com/koderover/zadig/pkg/tool/errors"
 )
 
 func DeleteWorkflows(productName, requestID string, log *zap.SugaredLogger) error {
-	workflows, err := mongodb.NewWorkflowColl().List(&mongodb.ListWorkflowOption{ProductName: productName})
+	workflows, err := mongodb.NewWorkflowColl().List(&mongodb.ListWorkflowOption{Projects: []string{productName}})
 	if err != nil {
 		log.Errorf("Workflow.List error: %v", err)
 		return fmt.Errorf("DeleteWorkflows productName %s Workflow.List error: %v", productName, err)
@@ -54,6 +55,19 @@ func DeleteWorkflows(productName, requestID string, log *zap.SugaredLogger) erro
 }
 
 func DeleteWorkflow(workflowName, requestID string, isDeletingProductTmpl bool, log *zap.SugaredLogger) error {
+	// query workflow before deleting, used to delete gerrit webhook
+	workflow, err := mongodb.NewWorkflowColl().Find(workflowName)
+	if err != nil {
+		log.Errorf("Workflow.Find error: %v", err)
+		return e.ErrDeleteWorkflow.AddDesc(err.Error())
+	}
+	workflowCMMap, err := collaboration.GetWorkflowCMMap([]string{workflow.ProductTmplName}, log)
+	if err != nil {
+		return err
+	}
+	if cmSets, ok := workflowCMMap[collaboration.BuildWorkflowCMMapKey(workflow.ProductTmplName, workflowName)]; ok {
+		return fmt.Errorf("this is a base workflow, collaborations:%v is related", cmSets.List())
+	}
 	taskQueue, err := mongodb.NewQueueColl().List(&mongodb.ListQueueOption{})
 	if err != nil {
 		log.Errorf("List queued task error: %v", err)
@@ -66,13 +80,6 @@ func DeleteWorkflow(workflowName, requestID string, isDeletingProductTmpl bool, 
 				log.Errorf("task still running, cancel pipeline %s task %d", task.PipelineName, task.TaskID)
 			}
 		}
-	}
-
-	// 在删除前，先将workflow查出来，用于删除gerrit webhook
-	workflow, err := mongodb.NewWorkflowColl().Find(workflowName)
-	if err != nil {
-		log.Errorf("Workflow.Find error: %v", err)
-		return e.ErrDeleteWorkflow.AddDesc(err.Error())
 	}
 
 	if !isDeletingProductTmpl {
@@ -89,7 +96,6 @@ func DeleteWorkflow(workflowName, requestID string, isDeletingProductTmpl bool, 
 	err = ProcessWebhook(nil, workflow.HookCtl.Items, webhook.WorkflowPrefix+workflow.Name, log)
 	if err != nil {
 		log.Errorf("Failed to process webhook, err: %s", err)
-		return e.ErrUpsertWorkflow.AddDesc(err.Error())
 	}
 
 	go gerrit.DeleteGerritWebhook(workflow, log)
@@ -113,7 +119,7 @@ func DeleteWorkflow(workflowName, requestID string, isDeletingProductTmpl bool, 
 		log.Errorf("PipelineTaskV2.DeleteByPipelineName error: %v", err)
 	}
 
-	if deliveryVersions, err := mongodb.NewDeliveryVersionColl().Find(&mongodb.DeliveryVersionArgs{OrgID: 1, WorkflowName: workflowName}); err == nil {
+	if deliveryVersions, err := mongodb.NewDeliveryVersionColl().Find(&mongodb.DeliveryVersionArgs{WorkflowName: workflowName}); err == nil {
 		for _, deliveryVersion := range deliveryVersions {
 			if err := mongodb.NewDeliveryVersionColl().Delete(deliveryVersion.ID.Hex()); err != nil {
 				log.Errorf("DeleteWorkflow.DeliveryVersion.Delete error: %v", err)
@@ -168,7 +174,7 @@ func ProcessWebhook(updatedHooks, currentHooks interface{}, name string, logger 
 		wg.Add(1)
 		go func(wh hookItem) {
 			defer wg.Done()
-			ch, err := codehost.GetCodeHostInfoByID(wh.codeHostID)
+			ch, err := systemconfig.New().GetCodeHost(wh.codeHostID)
 			if err != nil {
 				logger.Errorf("Failed to get codeHost by id %d, err: %s", wh.codeHostID, err)
 				errs = multierror.Append(errs, err)
@@ -176,10 +182,22 @@ func ProcessWebhook(updatedHooks, currentHooks interface{}, name string, logger 
 			}
 
 			switch ch.Type {
-			case setting.SourceFromGithub, setting.SourceFromGitlab:
-				err = webhook.NewClient().RemoveWebHook(wh.name, wh.owner, wh.repo, ch.Address, ch.AccessToken, name, ch.Type)
+			case setting.SourceFromGithub, setting.SourceFromGitlab, setting.SourceFromCodeHub:
+				err = webhook.NewClient().RemoveWebHook(&webhook.TaskOption{
+					Name:        wh.name,
+					Owner:       wh.owner,
+					Repo:        wh.repo,
+					Address:     ch.Address,
+					Token:       ch.AccessToken,
+					AK:          ch.AccessKey,
+					SK:          ch.SecretKey,
+					Region:      ch.Region,
+					EnableProxy: ch.EnableProxy,
+					Ref:         name,
+					From:        ch.Type,
+				})
 				if err != nil {
-					logger.Errorf("Failed to remove webhook %+v, err: %s", wh, err)
+					logger.Errorf("Failed to remove %s webhook %+v, err: %s", ch.Type, wh, err)
 					errs = multierror.Append(errs, err)
 					return
 				}
@@ -191,7 +209,7 @@ func ProcessWebhook(updatedHooks, currentHooks interface{}, name string, logger 
 		wg.Add(1)
 		go func(wh hookItem) {
 			defer wg.Done()
-			ch, err := codehost.GetCodeHostInfoByID(wh.codeHostID)
+			ch, err := systemconfig.New().GetCodeHost(wh.codeHostID)
 			if err != nil {
 				logger.Errorf("Failed to get codeHost by id %d, err: %s", wh.codeHostID, err)
 				errs = multierror.Append(errs, err)
@@ -199,10 +217,21 @@ func ProcessWebhook(updatedHooks, currentHooks interface{}, name string, logger 
 			}
 
 			switch ch.Type {
-			case setting.SourceFromGithub, setting.SourceFromGitlab:
-				err = webhook.NewClient().AddWebHook(wh.name, wh.owner, wh.repo, ch.Address, ch.AccessToken, name, ch.Type)
+			case setting.SourceFromGithub, setting.SourceFromGitlab, setting.SourceFromCodeHub:
+				err = webhook.NewClient().AddWebHook(&webhook.TaskOption{
+					Name:    wh.name,
+					Owner:   wh.owner,
+					Repo:    wh.repo,
+					Address: ch.Address,
+					Token:   ch.AccessToken,
+					Ref:     name,
+					AK:      ch.AccessKey,
+					SK:      ch.SecretKey,
+					Region:  ch.Region,
+					From:    ch.Type,
+				})
 				if err != nil {
-					logger.Errorf("Failed to add webhook %+v, err: %s", wh, err)
+					logger.Errorf("Failed to add %s webhook %+v, err: %s", ch.Type, wh, err)
 					errs = multierror.Append(errs, err)
 					return
 				}
@@ -250,6 +279,17 @@ func toHookSet(hooks interface{}) HookSet {
 					repo:  h.Repo,
 				},
 				codeHostID: h.CodeHostID,
+			})
+		}
+	case []*models.TestingHook:
+		for _, h := range hs {
+			res.Insert(hookItem{
+				hookUniqueID: hookUniqueID{
+					name:  h.MainRepo.Name,
+					owner: h.MainRepo.RepoOwner,
+					repo:  h.MainRepo.RepoName,
+				},
+				codeHostID: h.MainRepo.CodehostID,
 			})
 		}
 	}

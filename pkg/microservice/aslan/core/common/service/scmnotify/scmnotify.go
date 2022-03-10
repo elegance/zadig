@@ -17,14 +17,12 @@ limitations under the License.
 package scmnotify
 
 import (
-	"context"
 	"encoding/xml"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"strings"
 
-	"github.com/xanzy/go-gitlab"
 	"go.uber.org/zap"
 
 	"github.com/koderover/zadig/pkg/microservice/aslan/config"
@@ -32,7 +30,9 @@ import (
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models/task"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/s3"
+	"github.com/koderover/zadig/pkg/setting"
 	e "github.com/koderover/zadig/pkg/tool/errors"
+	s3tool "github.com/koderover/zadig/pkg/tool/s3"
 	"github.com/koderover/zadig/pkg/util"
 )
 
@@ -233,81 +233,6 @@ func (s *Service) UpdateWebhookComment(task *task.Task, logger *zap.SugaredLogge
 	return nil
 }
 
-// UpdateDiffNote 调用gitlab接口更新DiffNote，并更新到数据库
-func (s *Service) UpdateDiffNote(task *task.Task, logger *zap.SugaredLogger) (err error) {
-	if task.WorkflowArgs.NotificationID == "" {
-		return
-	}
-
-	var notification *models.Notification
-	if notification, err = s.Coll.Find(task.WorkflowArgs.NotificationID); err != nil {
-		logger.Errorf("can't find notification by id %s %s", task.WorkflowArgs.NotificationID, err)
-		return err
-	}
-
-	isAllTaskSucceed := true
-	for _, nTask := range notification.Tasks {
-		if nTask.Status != config.TaskStatusFailed && nTask.Status != config.TaskStatusCancelled &&
-			nTask.Status != config.TaskStatusPass && nTask.Status != config.TaskStatusTimeout {
-			// 存在任务没有执行完，直接返回
-			return nil
-		}
-		// 任务都执行完了，确认是否有未成功的任务
-		if nTask.Status != config.TaskStatusPass {
-			isAllTaskSucceed = false
-			break
-		}
-	}
-
-	body := "KodeRover CI 检查通过"
-	if !isAllTaskSucceed {
-		body = "KodeRover CI 检查失败"
-	}
-
-	opt := &mongodb.DiffNoteFindOpt{
-		CodehostID:     notification.CodehostID,
-		ProjectID:      notification.ProjectID,
-		MergeRequestID: notification.PrID,
-	}
-	diffNote, err := s.DiffNoteColl.Find(opt)
-	if err != nil {
-		logger.Errorf("can't find notification by id %s %v", task.WorkflowArgs.NotificationID, err)
-		return err
-	}
-
-	cli, _ := gitlab.NewOAuthClient(diffNote.Repo.OauthToken, gitlab.WithBaseURL(diffNote.Repo.Address))
-
-	// 更新note body
-	noteBodyOpt := &gitlab.UpdateMergeRequestDiscussionNoteOptions{
-		Body: &body,
-	}
-	_, _, err = cli.Discussions.UpdateMergeRequestDiscussionNote(diffNote.Repo.ProjectID, diffNote.MergeRequestID, diffNote.DiscussionID, diffNote.NoteID, noteBodyOpt)
-	if err != nil {
-		logger.Errorf("UpdateMergeRequestDiscussionNote failed, err: %v", err)
-		return err
-	}
-
-	// 更新resolved状态
-	resolveOpt := &gitlab.UpdateMergeRequestDiscussionNoteOptions{
-		Resolved: &isAllTaskSucceed,
-	}
-	_, _, err = cli.Discussions.UpdateMergeRequestDiscussionNote(diffNote.Repo.ProjectID, diffNote.MergeRequestID, diffNote.DiscussionID, diffNote.NoteID, resolveOpt)
-	if err != nil {
-		logger.Errorf("UpdateMergeRequestDiscussionNote failed, err: %v", err)
-		return err
-	}
-
-	diffNote.Resolved = isAllTaskSucceed
-	diffNote.Body = body
-	err = s.DiffNoteColl.Update(diffNote.ObjectID.Hex(), "", diffNote.Body, diffNote.Resolved)
-	if err != nil {
-		logger.Errorf("UpdateDiscussionInfo failed, err: %v", err)
-		return err
-	}
-
-	return nil
-}
-
 func downloadReport(taskInfo *task.Task, fileName, testName string, logger *zap.SugaredLogger) (*models.TestSuite, error) {
 	var store *s3.S3
 	var err error
@@ -327,26 +252,38 @@ func downloadReport(taskInfo *task.Task, fileName, testName string, logger *zap.
 		_ = os.Remove(tmpFilename)
 	}()
 
-	if err = s3.Download(context.Background(), store, fileName, tmpFilename); err == nil {
-		testRepo := new(models.TestSuite)
-		b, err := ioutil.ReadFile(tmpFilename)
-		if err != nil {
-			logger.Error(fmt.Sprintf("get test result file error: %v", err))
-			return nil, err
-		}
-
-		err = xml.Unmarshal(b, testRepo)
-		if err != nil {
-			logger.Errorf("unmarshal result file test suite summary error: %v", err)
-			return nil, err
-		}
-
-		testRepo.Name = testName
-
-		return testRepo, nil
+	objectKey := store.GetObjectPath(fileName)
+	forcedPathStyle := true
+	if store.Provider == setting.ProviderSourceAli {
+		forcedPathStyle = false
+	}
+	client, err := s3tool.NewClient(store.Endpoint, store.Ak, store.Sk, store.Insecure, forcedPathStyle)
+	if err != nil {
+		return nil, err
 	}
 
-	return nil, err
+	err = client.Download(store.Bucket, objectKey, tmpFilename)
+	if err != nil {
+		logger.Errorf("Failed to download object: %s, error is: %+v", objectKey, err)
+		return nil, err
+	}
+
+	testRepo := new(models.TestSuite)
+	b, err := ioutil.ReadFile(tmpFilename)
+	if err != nil {
+		logger.Error(fmt.Sprintf("get test result file error: %v", err))
+		return nil, err
+	}
+
+	err = xml.Unmarshal(b, testRepo)
+	if err != nil {
+		logger.Errorf("unmarshal result file test suite summary error: %v", err)
+		return nil, err
+	}
+
+	testRepo.Name = testName
+
+	return testRepo, nil
 }
 
 func DownloadTestReports(taskInfo *task.Task, logger *zap.SugaredLogger) ([]*models.TestSuite, error) {

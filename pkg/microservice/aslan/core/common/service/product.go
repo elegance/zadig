@@ -21,18 +21,23 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-multierror"
+	helmclient "github.com/mittwald/go-helm-client"
 	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	commonmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
-	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
+	commonrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
+	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb/template"
+	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/collaboration"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/kube"
 	"github.com/koderover/zadig/pkg/setting"
-	"github.com/koderover/zadig/pkg/shared/poetry"
+	kubeclient "github.com/koderover/zadig/pkg/shared/kube/client"
 	e "github.com/koderover/zadig/pkg/tool/errors"
-	"github.com/koderover/zadig/pkg/tool/helmclient"
+	helmtool "github.com/koderover/zadig/pkg/tool/helmclient"
+	"github.com/koderover/zadig/pkg/tool/kube/informer"
 	"github.com/koderover/zadig/pkg/tool/kube/updater"
 )
 
@@ -42,13 +47,23 @@ const (
 
 func DeleteProduct(username, envName, productName, requestID string, log *zap.SugaredLogger) (err error) {
 	eventStart := time.Now().Unix()
-	productInfo, err := mongodb.NewProductColl().Find(&mongodb.ProductFindOptions{Name: productName, EnvName: envName})
+	productInfo, err := commonrepo.NewProductColl().Find(&commonrepo.ProductFindOptions{Name: productName, EnvName: envName})
 	if err != nil {
 		log.Errorf("find product error: %v", err)
 		return e.ErrDeleteEnv.AddDesc("not found")
 	}
 
-	kubeClient, err := kube.GetKubeClient(productInfo.ClusterID)
+	// delete informer's cache
+	informer.DeleteInformer(productInfo.ClusterID, productInfo.Namespace)
+
+	envCMMap, err := collaboration.GetEnvCMMap([]string{productName}, log)
+	if err != nil {
+		return err
+	}
+	if cmSets, ok := envCMMap[collaboration.BuildEnvCMMapKey(productName, envName)]; ok {
+		return fmt.Errorf("this is a base environment, collaborations:%v is related", cmSets.List())
+	}
+	kubeClient, err := kubeclient.GetKubeClient(config.HubServerAddress(), productInfo.ClusterID)
 	if err != nil {
 		return e.ErrDeleteEnv.AddErr(err)
 	}
@@ -59,7 +74,7 @@ func DeleteProduct(username, envName, productName, requestID string, log *zap.Su
 	}
 
 	// 设置产品状态
-	err = mongodb.NewProductColl().UpdateStatus(envName, productName, setting.ProductStatusDeleting)
+	err = commonrepo.NewProductColl().UpdateStatus(envName, productName, setting.ProductStatusDeleting)
 	if err != nil {
 		log.Errorf("[%s][%s] update product status error: %v", username, productInfo.Namespace, err)
 		return e.ErrDeleteEnv.AddDesc("更新集成环境状态失败: " + err.Error())
@@ -68,18 +83,11 @@ func DeleteProduct(username, envName, productName, requestID string, log *zap.Su
 	log.Infof("[%s] delete product %s", username, productInfo.Namespace)
 	LogProductStats(username, setting.DeleteProductEvent, productName, requestID, eventStart, log)
 
-	poetryClient := poetry.New(config.PoetryAPIServer(), config.PoetryAPIRootKey())
-
 	switch productInfo.Source {
 	case setting.SourceFromHelm:
-		err = mongodb.NewProductColl().Delete(envName, productName)
+		err = commonrepo.NewProductColl().Delete(envName, productName)
 		if err != nil {
 			log.Errorf("Product.Delete error: %v", err)
-		}
-
-		_, err = poetryClient.DeleteEnvRolePermission(productName, envName, log)
-		if err != nil {
-			log.Errorf("DeleteEnvRole error: %v", err)
 		}
 
 		go func() {
@@ -89,7 +97,7 @@ func DeleteProduct(username, envName, productName, requestID string, log *zap.Su
 					// 发送删除产品失败消息给用户
 					title := fmt.Sprintf("删除项目:[%s] 环境:[%s] 失败!", productName, envName)
 					SendErrorMessage(username, title, requestID, err, log)
-					_ = mongodb.NewProductColl().UpdateStatus(envName, productName, setting.ProductStatusUnknown)
+					_ = commonrepo.NewProductColl().UpdateStatus(envName, productName, setting.ProductStatusUnknown)
 				} else {
 					title := fmt.Sprintf("删除项目:[%s] 环境:[%s] 成功!", productName, envName)
 					content := fmt.Sprintf("namespace:%s", productInfo.Namespace)
@@ -98,10 +106,10 @@ func DeleteProduct(username, envName, productName, requestID string, log *zap.Su
 			}()
 
 			//卸载helm release资源
-			if helmClient, err := helmclient.NewClientFromRestConf(restConfig, productInfo.Namespace); err == nil {
+			if hc, err := helmtool.NewClientFromRestConf(restConfig, productInfo.Namespace); err == nil {
 				for _, services := range productInfo.Services {
 					for _, service := range services {
-						if err = helmClient.UninstallRelease(&helmclient.ChartSpec{
+						if err = hc.UninstallRelease(&helmclient.ChartSpec{
 							ReleaseName: fmt.Sprintf("%s-%s", productInfo.Namespace, service.ServiceName),
 							Namespace:   productInfo.Namespace,
 							Wait:        true,
@@ -124,14 +132,68 @@ func DeleteProduct(username, envName, productName, requestID string, log *zap.Su
 			}
 		}()
 	case setting.SourceFromExternal:
-		err = mongodb.NewProductColl().Delete(envName, productName)
+		err = commonrepo.NewProductColl().Delete(envName, productName)
 		if err != nil {
 			log.Errorf("Product.Delete error: %v", err)
 		}
 
-		_, err = poetryClient.DeleteEnvRolePermission(productName, envName, log)
+		// 删除workload数据
+		tempProduct, err := template.NewProductColl().Find(productName)
 		if err != nil {
-			log.Errorf("DeleteEnvRole error: %v", err)
+			log.Errorf("project not found error:%s", err)
+		}
+		if tempProduct.ProductFeature != nil && tempProduct.ProductFeature.CreateEnvType == setting.SourceFromExternal {
+			workloadStat, err := commonrepo.NewWorkLoadsStatColl().Find(productInfo.ClusterID, productInfo.Namespace)
+			if err != nil {
+				log.Errorf("workflowStat not found error:%s", err)
+			}
+			if workloadStat != nil {
+				workloadStat.Workloads = filterWorkloadsByEnv(workloadStat.Workloads, productInfo.EnvName)
+				if err := commonrepo.NewWorkLoadsStatColl().UpdateWorkloads(workloadStat); err != nil {
+					log.Errorf("update workloads fail error:%s", err)
+				}
+			}
+			// 获取所有external的服务
+			currentEnvServices, err := commonrepo.NewServiceColl().ListExternalWorkloadsBy(productName, envName)
+			if err != nil {
+				log.Errorf("failed to list external workload, error:%s", err)
+			}
+
+			externalEnvServices, err := commonrepo.NewServicesInExternalEnvColl().List(&commonrepo.ServicesInExternalEnvArgs{
+				ProductName:    productName,
+				ExcludeEnvName: envName,
+			})
+			if err != nil {
+				log.Errorf("failed to list external service, error:%s", err)
+			}
+
+			externalEnvServiceM := make(map[string]bool)
+			for _, externalEnvService := range externalEnvServices {
+				externalEnvServiceM[externalEnvService.ServiceName] = true
+			}
+
+			deleteServices := sets.NewString()
+			for _, currentEnvService := range currentEnvServices {
+				if _, isExist := externalEnvServiceM[currentEnvService.ServiceName]; !isExist {
+					deleteServices.Insert(currentEnvService.ServiceName)
+				}
+			}
+			err = commonrepo.NewServiceColl().BatchUpdateExternalServicesStatus(productName, "", setting.ProductStatusDeleting, deleteServices.List())
+			if err != nil {
+				log.Errorf("UpdateStatus external services error:%s", err)
+			}
+			// delete services_in_external_env data
+			if err = commonrepo.NewServicesInExternalEnvColl().Delete(&commonrepo.ServicesInExternalEnvArgs{
+				ProductName: productName,
+				EnvName:     envName,
+			}); err != nil {
+				log.Errorf("remove services in external env error:%s", err)
+			}
+		}
+	case setting.SourceFromPM:
+		err = commonrepo.NewProductColl().Delete(envName, productName)
+		if err != nil {
+			log.Errorf("Product.Delete error: %v", err)
 		}
 	default:
 		go func() {
@@ -141,7 +203,7 @@ func DeleteProduct(username, envName, productName, requestID string, log *zap.Su
 					// 发送删除产品失败消息给用户
 					title := fmt.Sprintf("删除项目:[%s] 环境:[%s] 失败!", productName, envName)
 					SendErrorMessage(username, title, requestID, err, log)
-					_ = mongodb.NewProductColl().UpdateStatus(envName, productName, setting.ProductStatusUnknown)
+					_ = commonrepo.NewProductColl().UpdateStatus(envName, productName, setting.ProductStatusUnknown)
 				} else {
 					title := fmt.Sprintf("删除项目:[%s] 环境:[%s] 成功!", productName, envName)
 					content := fmt.Sprintf("namespace:%s", productInfo.Namespace)
@@ -176,19 +238,23 @@ func DeleteProduct(username, envName, productName, requestID string, log *zap.Su
 			//	return
 			//}
 
-			err = mongodb.NewProductColl().Delete(envName, productName)
+			err = commonrepo.NewProductColl().Delete(envName, productName)
 			if err != nil {
 				log.Errorf("Product.Delete error: %v", err)
 			}
-
-			_, err = poetryClient.DeleteEnvRolePermission(productName, envName, log)
-			if err != nil {
-				log.Errorf("DeleteEnvRole error: %v", err)
-			}
 		}()
 	}
-
 	return nil
+}
+
+func filterWorkloadsByEnv(exist []commonmodels.Workload, env string) []commonmodels.Workload {
+	result := make([]commonmodels.Workload, 0)
+	for _, v := range exist {
+		if v.EnvName != env {
+			result = append(result, v)
+		}
+	}
+	return result
 }
 
 func DeleteClusterResourceAsync(selector labels.Selector, kubeClient client.Client, log *zap.SugaredLogger) error {
@@ -288,7 +354,17 @@ func DeleteResourcesAsync(namespace string, selector labels.Selector, kubeClient
 	return errors.ErrorOrNil()
 }
 
-func GetProductEnvNamespace(envName, productName string) string {
-	product := &commonmodels.Product{EnvName: envName, ProductName: productName}
-	return product.GetNamespace()
+func GetProductEnvNamespace(envName, productName, namespace string) string {
+	if namespace != "" {
+		return namespace
+	}
+	product, err := commonrepo.NewProductColl().Find(&commonrepo.ProductFindOptions{
+		Name:    productName,
+		EnvName: envName,
+	})
+	if err != nil {
+		product = &commonmodels.Product{EnvName: envName, ProductName: productName}
+		return product.GetNamespace()
+	}
+	return product.Namespace
 }

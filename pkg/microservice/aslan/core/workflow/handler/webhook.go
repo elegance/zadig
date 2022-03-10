@@ -27,6 +27,7 @@ import (
 
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/workflow/service/webhook"
 	internalhandler "github.com/koderover/zadig/pkg/shared/handler"
+	"github.com/koderover/zadig/pkg/tool/codehub"
 )
 
 // @Router /workflow/webhook [POST]
@@ -43,11 +44,12 @@ func ProcessWebHook(c *gin.Context) {
 		ctx.Err = err
 		return
 	}
-
 	if github.WebHookType(c.Request) != "" {
 		ctx.Err = processGithub(payload, c.Request, ctx.RequestID, ctx.Logger)
 	} else if gitlab.HookEventType(c.Request) != "" {
 		ctx.Err = webhook.ProcessGitlabHook(payload, c.Request, ctx.RequestID, ctx.Logger)
+	} else if codehub.HookEventType(c.Request) != "" {
+		ctx.Err = webhook.ProcessCodehubHook(payload, c.Request, ctx.RequestID, ctx.Logger)
 	} else {
 		ctx.Err = webhook.ProcessGerritHook(payload, c.Request, ctx.RequestID, ctx.Logger)
 	}
@@ -70,6 +72,11 @@ func processGithub(payload []byte, req *http.Request, requestID string, log *zap
 		log.Errorf("error happens to trigger workflow %v", err)
 		errs = multierror.Append(errs, err)
 	}
-
+	//测试管理webhook
+	err = webhook.ProcessGithubWebHookForTest(payload, req, requestID, log)
+	if err != nil {
+		log.Errorf("error happens to trigger ProcessGithubWebHookForTest %v", err)
+		errs = multierror.Append(errs, err)
+	}
 	return errs.ErrorOrNil()
 }

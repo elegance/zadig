@@ -17,20 +17,22 @@ limitations under the License.
 package service
 
 import (
-	"context"
-	"fmt"
+	"io/fs"
 	"os"
 	"path"
 
+	"github.com/27149chen/afero"
 	"go.uber.org/zap"
 
+	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	commonmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	commonrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
-	s3service "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/s3"
+	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/command"
+	fsservice "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/fs"
 	"github.com/koderover/zadig/pkg/setting"
-	e "github.com/koderover/zadig/pkg/tool/errors"
+	"github.com/koderover/zadig/pkg/shared/client/systemconfig"
 	"github.com/koderover/zadig/pkg/tool/log"
-	"github.com/koderover/zadig/pkg/util"
+	fsutil "github.com/koderover/zadig/pkg/util/fs"
 )
 
 func ListHelmRepos(log *zap.SugaredLogger) ([]*commonmodels.HelmRepo, error) {
@@ -43,30 +45,104 @@ func ListHelmRepos(log *zap.SugaredLogger) ([]*commonmodels.HelmRepo, error) {
 	return helmRepos, nil
 }
 
-func DownloadService(base, serviceName string) error {
-	s3Storage, err := s3service.FindDefaultS3()
+func PreLoadServiceManifests(base string, svc *commonmodels.Service) error {
+	ok, err := fsutil.DirExists(base)
 	if err != nil {
-		log.Errorf("获取默认的s3配置失败 err:%v", err)
-		return e.ErrListTemplate.AddDesc(err.Error())
-	}
-	subFolderName := serviceName + "-" + setting.HelmDeployType
-	if s3Storage.Subfolder != "" {
-		s3Storage.Subfolder = fmt.Sprintf("%s/%s/%s", s3Storage.Subfolder, subFolderName, "service")
-	} else {
-		s3Storage.Subfolder = fmt.Sprintf("%s/%s", subFolderName, "service")
-	}
-	filePath := fmt.Sprintf("%s.tar.gz", serviceName)
-	tarFilePath := path.Join(base, filePath)
-	if err = s3service.Download(context.Background(), s3Storage, filePath, tarFilePath); err != nil {
-		log.Errorf("s3下载文件失败 err:%v", err)
+		log.Errorf("Failed to check if dir %s is exiting, err: %s", base, err)
 		return err
 	}
-	if err = util.UnTar("/", tarFilePath); err != nil {
-		log.Errorf("unTar err:%v", err)
+	if ok {
+		return nil
+	}
+
+	if err = DownloadServiceManifests(base, svc.ProductName, svc.ServiceName); err == nil {
+		return nil
+	}
+
+	log.Warnf("Failed to download service from s3, err: %s", err)
+	switch svc.Source {
+	case setting.SourceFromGerrit:
+		return preLoadServiceManifestsFromGerrit(svc)
+	default:
+		return preLoadServiceManifestsFromSource(svc)
+	}
+}
+
+func PreloadServiceManifestsByRevision(base string, svc *commonmodels.Service) error {
+	ok, err := fsutil.DirExists(base)
+	if err != nil {
+		log.Errorf("Failed to check if dir %s is exiting, err: %s", base, err)
 		return err
 	}
-	if err = os.Remove(tarFilePath); err != nil {
-		log.Errorf("remove file err:%v", err)
+	if ok {
+		return nil
+	}
+
+	//download chart info by revision
+	serviceNameWithRevision := config.ServiceNameWithRevision(svc.ServiceName, svc.Revision)
+	s3Base := config.ObjectStorageServicePath(svc.ProductName, svc.ServiceName)
+	return fsservice.DownloadAndExtractFilesFromS3(serviceNameWithRevision, base, s3Base, log.SugaredLogger())
+}
+
+func DownloadServiceManifests(base, projectName, serviceName string) error {
+	s3Base := config.ObjectStorageServicePath(projectName, serviceName)
+
+	return fsservice.DownloadAndExtractFilesFromS3(serviceName, base, s3Base, log.SugaredLogger())
+}
+
+func SaveAndUploadService(projectName, serviceName string, copies []string, fileTree fs.FS) error {
+	localBase := config.LocalServicePath(projectName, serviceName)
+	s3Base := config.ObjectStorageServicePath(projectName, serviceName)
+	names := append([]string{serviceName}, copies...)
+	return fsservice.SaveAndUploadFiles(fileTree, names, localBase, s3Base, log.SugaredLogger())
+}
+
+func CopyAndUploadService(projectName, serviceName, currentChartPath string, copies []string) error {
+	localBase := config.LocalServicePath(projectName, serviceName)
+	s3Base := config.ObjectStorageServicePath(projectName, serviceName)
+	names := append([]string{serviceName}, copies...)
+
+	return fsservice.CopyAndUploadFiles(names, path.Join(localBase, serviceName), s3Base, currentChartPath, log.SugaredLogger())
+}
+
+func preLoadServiceManifestsFromSource(svc *commonmodels.Service) error {
+	tree, err := fsservice.DownloadFilesFromSource(
+		&fsservice.DownloadFromSourceArgs{CodehostID: svc.CodehostID, Owner: svc.RepoOwner, Repo: svc.RepoName, Path: svc.LoadPath, Branch: svc.BranchName, RepoLink: svc.SrcPath},
+		func(afero.Fs) (string, error) {
+			return svc.ServiceName, nil
+		})
+	if err != nil {
+		return err
+	}
+
+	// save files to disk and upload them to s3
+	if err = SaveAndUploadService(svc.ProductName, svc.ServiceName, nil, tree); err != nil {
+		log.Errorf("Failed to save or upload files for service %s in project %s, error: %s", svc.ServiceName, svc.ProductName, err)
+		return err
+	}
+
+	return nil
+}
+
+func preLoadServiceManifestsFromGerrit(svc *commonmodels.Service) error {
+	base := path.Join(config.S3StoragePath(), svc.GerritRepoName)
+	if err := os.RemoveAll(base); err != nil {
+		log.Errorf("Failed to remove dir, err:%s", err)
+	}
+	detail, err := systemconfig.New().GetCodeHost(svc.GerritCodeHostID)
+	if err != nil {
+		log.Errorf("Failed to GetCodehostDetail, err:%s", err)
+		return err
+	}
+	err = command.RunGitCmds(detail, "default", svc.GerritRepoName, svc.GerritBranchName, svc.GerritRemoteName)
+	if err != nil {
+		log.Errorf("Failed to runGitCmds, err:%s", err)
+		return err
+	}
+	// save files to disk and upload them to s3
+	if err := CopyAndUploadService(svc.ProductName, svc.ServiceName, svc.GerritPath, nil); err != nil {
+		log.Errorf("Failed to save or upload files for service %s in project %s, error: %s", svc.ServiceName, svc.ProductName, err)
+		return err
 	}
 	return nil
 }

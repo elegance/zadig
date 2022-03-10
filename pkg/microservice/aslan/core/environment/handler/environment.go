@@ -18,19 +18,19 @@ package handler
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	commonmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models/template"
+	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
 	commonservice "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service"
 	"github.com/koderover/zadig/pkg/microservice/aslan/core/environment/service"
 	"github.com/koderover/zadig/pkg/setting"
@@ -38,7 +38,6 @@ import (
 	"github.com/koderover/zadig/pkg/shared/kube/resource"
 	e "github.com/koderover/zadig/pkg/tool/errors"
 	"github.com/koderover/zadig/pkg/tool/log"
-	"github.com/koderover/zadig/pkg/types/permission"
 )
 
 type UpdateEnvs struct {
@@ -55,34 +54,57 @@ type NamespaceResource struct {
 	Ingresses []resource.Ingress           `json:"ingresses"`
 }
 
-// ListProducts list all product information
+type UpdateProductRegistryRequest struct {
+	RegistryID string `json:"registry_id"`
+}
+
 func ListProducts(c *gin.Context) {
 	ctx := internalhandler.NewContext(c)
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
+	projectName := c.Query("projectName")
+	if projectName == "" {
+		ctx.Err = e.ErrInvalidParam
+		return
+	}
 
-	ctx.Resp, ctx.Err = service.ListProducts(c.Query("productName"), c.Query("envType"), ctx.User.Name, ctx.User.ID, ctx.User.IsSuperUser, ctx.Logger)
+	envNames, found := internalhandler.GetResourcesInHeader(c)
+	if found && len(envNames) == 0 {
+		ctx.Resp = []*service.ProductResp{}
+		return
+	}
+
+	ctx.Resp, ctx.Err = service.ListProducts(projectName, envNames, ctx.Logger)
 }
 
-func AutoCreateProduct(c *gin.Context) {
+func UpdateMultiProducts(c *gin.Context) {
 	ctx := internalhandler.NewContext(c)
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
 
-	ctx.Resp = service.AutoCreateProduct(c.Param("productName"), c.Query("envType"), ctx.RequestID, ctx.Logger)
-}
-
-func AutoUpdateProduct(c *gin.Context) {
-	ctx := internalhandler.NewContext(c)
-	defer func() { internalhandler.JSONResponse(c, ctx) }()
+	if c.Query("helm") == "true" {
+		updateMultiHelmEnv(c, ctx)
+		return
+	}
 
 	args := new(UpdateEnvs)
 	data, err := c.GetRawData()
 	if err != nil {
-		log.Errorf("AutoUpdateProduct c.GetRawData() err : %v", err)
+		log.Errorf("UpdateMultiProducts c.GetRawData() err : %v", err)
 	}
 	if err = json.Unmarshal(data, args); err != nil {
-		log.Errorf("AutoUpdateProduct json.Unmarshal err : %v", err)
+		log.Errorf("UpdateMultiProducts json.Unmarshal err : %v", err)
 	}
-	internalhandler.InsertOperationLog(c, ctx.Username, c.Param("productName"), "自动更新", "集成环境", strings.Join(args.EnvNames, ","), fmt.Sprintf("%s,%s", permission.TestEnvManageUUID, permission.ProdEnvManageUUID), string(data), ctx.Logger)
+
+	allowedEnvs, found := internalhandler.GetResourcesInHeader(c)
+	if found {
+		allowedSet := sets.NewString(allowedEnvs...)
+		currentSet := sets.NewString(args.EnvNames...)
+		if !allowedSet.IsSuperset(currentSet) {
+			c.String(http.StatusForbidden, "not all input envs are allowed, allowed envs are %v", allowedEnvs)
+			return
+		}
+	}
+
+	internalhandler.InsertOperationLog(c, ctx.UserName, c.Query("projectName"), "自动更新", "集成环境", strings.Join(args.EnvNames, ","), string(data), ctx.Logger)
 	c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(data))
 
 	if err := c.BindJSON(args); err != nil {
@@ -92,12 +114,96 @@ func AutoUpdateProduct(c *gin.Context) {
 	}
 
 	force, _ := strconv.ParseBool(c.Query("force"))
-	ctx.Resp, ctx.Err = service.AutoUpdateProduct(args.EnvNames, c.Param("productName"), ctx.User.ID, ctx.User.IsSuperUser, ctx.RequestID, force, ctx.Logger)
+	ctx.Resp, ctx.Err = service.AutoUpdateProduct(args.EnvNames, c.Query("projectName"), ctx.RequestID, force, ctx.Logger)
+}
+
+func createHelmProduct(c *gin.Context, ctx *internalhandler.Context) {
+	projectName := c.Query("projectName")
+	if projectName == "" {
+		ctx.Err = e.ErrInvalidParam.AddDesc("projectName can not be empty")
+		return
+	}
+	createArgs := make([]*service.CreateHelmProductArg, 0)
+	data, err := c.GetRawData()
+	if err != nil {
+		log.Errorf("CreateHelmProduct c.GetRawData() err : %v", err)
+	} else if err = json.Unmarshal(data, &createArgs); err != nil {
+		log.Errorf("CreateHelmProduct json.Unmarshal err : %v", err)
+	}
+	if err != nil {
+		ctx.Err = e.ErrInvalidParam.AddErr(err)
+		return
+	}
+
+	envNameList := make([]string, 0)
+	for _, arg := range createArgs {
+		if arg.EnvName == "" {
+			ctx.Err = e.ErrInvalidParam.AddDesc("envName is empty")
+			return
+		}
+		arg.ProductName = projectName
+		envNameList = append(envNameList, arg.EnvName)
+	}
+
+	internalhandler.InsertOperationLog(c, ctx.UserName, projectName, "新增", "集成环境", strings.Join(envNameList, "-"), string(data), ctx.Logger)
+
+	ctx.Err = service.CreateHelmProduct(
+		projectName, ctx.UserName, ctx.RequestID, createArgs, ctx.Logger,
+	)
+}
+
+func copyHelmProduct(c *gin.Context, ctx *internalhandler.Context) {
+	projectName := c.Query("projectName")
+	if projectName == "" {
+		ctx.Err = e.ErrInvalidParam.AddDesc("projectName can not be empty")
+		return
+	}
+
+	createArgs := make([]*service.CreateHelmProductArg, 0)
+	data, err := c.GetRawData()
+	if err != nil {
+		log.Errorf("copyHelmProduct c.GetRawData() err : %s", err)
+	} else if err = json.Unmarshal(data, &createArgs); err != nil {
+		log.Errorf("copyHelmProduct json.Unmarshal err : %s", err)
+	}
+	if err != nil {
+		ctx.Err = e.ErrInvalidParam.AddErr(err)
+		return
+	}
+
+	envNameCopyList := make([]string, 0)
+	for _, arg := range createArgs {
+		if arg.EnvName == "" || arg.BaseEnvName == "" {
+			ctx.Err = e.ErrInvalidParam.AddDesc("envName or baseEnvName is empty")
+			return
+		}
+		arg.ProductName = projectName
+		envNameCopyList = append(envNameCopyList, arg.BaseEnvName+"-->"+arg.EnvName)
+	}
+
+	internalhandler.InsertOperationLog(c, ctx.UserName, projectName, "复制", "集成环境", strings.Join(envNameCopyList, ","), string(data), ctx.Logger)
+
+	ctx.Err = service.CopyHelmProduct(
+		projectName, ctx.UserName, ctx.RequestID, createArgs, ctx.Logger,
+	)
 }
 
 func CreateProduct(c *gin.Context) {
 	ctx := internalhandler.NewContext(c)
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	if c.Query("auto") == "true" {
+		ctx.Resp = service.AutoCreateProduct(c.Query("projectName"), c.Query("envType"), ctx.RequestID, ctx.Logger)
+		return
+	}
+	if c.Query("helm") == "true" {
+		if c.Query("scene") == "copy" {
+			copyHelmProduct(c, ctx)
+			return
+		}
+		createHelmProduct(c, ctx)
+		return
+	}
 
 	args := new(commonmodels.Product)
 	data, err := c.GetRawData()
@@ -107,7 +213,17 @@ func CreateProduct(c *gin.Context) {
 	if err = json.Unmarshal(data, args); err != nil {
 		log.Errorf("CreateProduct json.Unmarshal err : %v", err)
 	}
-	internalhandler.InsertOperationLog(c, ctx.Username, args.ProductName, "新增", "集成环境", args.EnvName, fmt.Sprintf("%s,%s", permission.TestEnvCreateUUID, permission.ProdEnvCreateUUID), string(data), ctx.Logger)
+
+	allowedClusters, found := internalhandler.GetResourcesInHeader(c)
+	if found {
+		allowedSet := sets.NewString(allowedClusters...)
+		if !allowedSet.Has(args.ClusterID) {
+			c.String(http.StatusForbidden, "permission denied for cluster %s", args.ClusterID)
+			return
+		}
+	}
+
+	internalhandler.InsertOperationLog(c, ctx.UserName, args.ProductName, "新增", "集成环境", args.EnvName, string(data), ctx.Logger)
 	c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(data))
 
 	if err := c.BindJSON(args); err != nil {
@@ -120,9 +236,9 @@ func CreateProduct(c *gin.Context) {
 		return
 	}
 
-	args.UpdateBy = ctx.Username
+	args.UpdateBy = ctx.UserName
 	ctx.Err = service.CreateProduct(
-		ctx.Username, ctx.RequestID, args, ctx.Logger,
+		ctx.UserName, ctx.RequestID, args, ctx.Logger,
 	)
 }
 
@@ -130,8 +246,8 @@ func UpdateProduct(c *gin.Context) {
 	ctx := internalhandler.NewContext(c)
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
 
-	envName := c.Query("envName")
-	productName := c.Param("productName")
+	envName := c.Param("name")
+	projectName := c.Query("projectName")
 
 	args := new(commonmodels.Product)
 	data, err := c.GetRawData()
@@ -140,8 +256,10 @@ func UpdateProduct(c *gin.Context) {
 	}
 	if err = json.Unmarshal(data, args); err != nil {
 		log.Errorf("UpdateProduct json.Unmarshal err : %v", err)
+		ctx.Err = e.ErrInvalidParam.AddDesc(err.Error())
+		return
 	}
-	internalhandler.InsertOperationLog(c, ctx.Username, productName, "更新", "集成环境", envName, fmt.Sprintf("%s,%s", permission.TestEnvManageUUID, permission.ProdEnvManageUUID), string(data), ctx.Logger)
+	internalhandler.InsertOperationLog(c, ctx.UserName, projectName, "更新", "集成环境", envName, string(data), ctx.Logger)
 	c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(data))
 
 	if err := c.BindJSON(args); err != nil {
@@ -151,9 +269,39 @@ func UpdateProduct(c *gin.Context) {
 
 	force, _ := strconv.ParseBool(c.Query("force"))
 	// update product asynchronously
-	ctx.Err = service.UpdateProductV2(envName, productName, ctx.Username, ctx.RequestID, force, args.Vars, ctx.Logger)
+	ctx.Err = service.UpdateProductV2(envName, projectName, ctx.UserName, ctx.RequestID, force, args.Vars, ctx.Logger)
 	if ctx.Err != nil {
-		ctx.Logger.Errorf("failed to update product %s %s: %v", envName, productName, ctx.Err)
+		ctx.Logger.Errorf("failed to update product %s %s: %v", envName, projectName, ctx.Err)
+	}
+}
+
+func UpdateProductRegistry(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+	envName := c.Param("name")
+	projectName := c.Query("projectName")
+	args := new(UpdateProductRegistryRequest)
+	data, err := c.GetRawData()
+	if err != nil {
+		log.Errorf("UpdateProduct c.GetRawData() err : %v", err)
+		ctx.Err = e.ErrInvalidParam.AddDesc(err.Error())
+		return
+	}
+	if err = json.Unmarshal(data, args); err != nil {
+		log.Errorf("UpdateProduct json.Unmarshal err : %v", err)
+		ctx.Err = e.ErrInvalidParam.AddDesc(err.Error())
+		return
+	}
+	internalhandler.InsertOperationLog(c, ctx.UserName, projectName, "更新", "集成环境", envName, string(data), ctx.Logger)
+	c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(data))
+
+	if err := c.BindJSON(args); err != nil {
+		ctx.Err = e.ErrInvalidParam.AddDesc(err.Error())
+		return
+	}
+	ctx.Err = service.UpdateProductRegistry(envName, projectName, args.RegistryID, ctx.Logger)
+	if ctx.Err != nil {
+		ctx.Logger.Errorf("failed to update product %s %s: %v", envName, args.RegistryID, ctx.Err)
 	}
 }
 
@@ -161,11 +309,11 @@ func UpdateProductRecycleDay(c *gin.Context) {
 	ctx := internalhandler.NewContext(c)
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
 
-	envName := c.Query("envName")
-	productName := c.Param("productName")
+	envName := c.Param("name")
+	projectName := c.Query("projectName")
 	recycleDayStr := c.Query("recycleDay")
 
-	internalhandler.InsertOperationLog(c, ctx.Username, productName, "更新", "集成环境-环境回收", envName, permission.TestEnvManageUUID, "", ctx.Logger)
+	internalhandler.InsertOperationLog(c, ctx.UserName, projectName, "更新", "集成环境-环境回收", envName, "", ctx.Logger)
 
 	var (
 		recycleDay int
@@ -181,146 +329,76 @@ func UpdateProductRecycleDay(c *gin.Context) {
 		return
 	}
 
-	ctx.Err = service.UpdateProductRecycleDay(envName, productName, recycleDay)
+	ctx.Err = service.UpdateProductRecycleDay(envName, projectName, recycleDay)
 }
 
-func UpdateHelmProduct(c *gin.Context) {
+func EstimatedValues(c *gin.Context) {
 	ctx := internalhandler.NewContext(c)
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
 
-	envName := c.Query("envName")
-	updateType := c.Query("updateType")
-	productName := c.Param("productName")
-
-	ctx.Err = service.UpdateHelmProduct(productName, envName, updateType, ctx.Username, ctx.RequestID, ctx.Logger)
-	if ctx.Err != nil {
-		ctx.Logger.Errorf("failed to update product %s %s: %v", envName, productName, ctx.Err)
+	envName := c.Param("name")
+	projectName := c.Query("projectName")
+	if projectName == "" {
+		ctx.Err = e.ErrInvalidParam.AddDesc("projectName can't be empty!")
+		return
 	}
+
+	serviceName := c.Query("serviceName")
+	if serviceName == "" {
+		ctx.Err = e.ErrInvalidParam.AddDesc("serviceName can't be empty!")
+		return
+	}
+
+	arg := new(service.EstimateValuesArg)
+	if err := c.ShouldBind(arg); err != nil {
+		ctx.Err = e.ErrInvalidParam.AddDesc(err.Error())
+		return
+	}
+
+	ctx.Resp, ctx.Err = service.GeneEstimatedValues(projectName, envName, serviceName, c.Query("scene"), c.Query("format"), arg, ctx.Logger)
 }
 
-func UpdateHelmProductVariable(c *gin.Context) {
+func UpdateHelmProductRenderset(c *gin.Context) {
 	ctx := internalhandler.NewContext(c)
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
 
-	envName := c.Query("envName")
-	productName := c.Param("productName")
+	projectName := c.Query("projectName")
+	if projectName == "" {
+		ctx.Err = e.ErrInvalidParam.AddDesc("projectName can't be empty!")
+		return
+	}
 
-	args := new(ChartInfoArgs)
+	envName := c.Param("name")
+	if envName == "" {
+		ctx.Err = e.ErrInvalidParam.AddDesc("envName can't be empty!")
+		return
+	}
+
+	arg := new(service.EnvRendersetArg)
 	data, err := c.GetRawData()
 	if err != nil {
 		log.Errorf("UpdateHelmProductVariable c.GetRawData() err : %v", err)
 	}
-	if err = json.Unmarshal(data, args); err != nil {
+	if err = json.Unmarshal(data, arg); err != nil {
 		log.Errorf("UpdateHelmProductVariable json.Unmarshal err : %v", err)
 	}
-	internalhandler.InsertOperationLog(c, ctx.Username, c.Param("productName"), "更新", "helm集成环境变量", "", permission.TestEnvManageUUID, string(data), ctx.Logger)
-	c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(data))
 
-	if err := c.BindJSON(args); err != nil {
-		ctx.Logger.Error(err)
-		ctx.Err = e.ErrInvalidParam.AddDesc(err.Error())
+	internalhandler.InsertOperationLog(c, ctx.UserName, projectName, "更新", "更新环境变量", "", string(data), ctx.Logger)
+
+	ctx.Err = service.UpdateHelmProductRenderset(projectName, envName, ctx.UserName, ctx.RequestID, arg, ctx.Logger)
+	if ctx.Err != nil {
+		ctx.Logger.Errorf("failed to update product Variable %s %s: %v", envName, projectName, ctx.Err)
+	}
+}
+
+func updateMultiHelmEnv(c *gin.Context, ctx *internalhandler.Context) {
+	projectName := c.Query("projectName")
+	if projectName == "" {
+		ctx.Err = e.ErrInvalidParam.AddDesc("projectName can not be empty")
 		return
 	}
 
-	ctx.Err = service.UpdateHelmProductVariable(productName, envName, ctx.Username, ctx.RequestID, args.ChartInfos, ctx.Logger)
-	if ctx.Err != nil {
-		ctx.Logger.Errorf("failed to update product Variable %s %s: %v", envName, productName, ctx.Err)
-	}
-}
-
-func UpdateMultiHelmProduct(c *gin.Context) {
-	ctx := internalhandler.NewContext(c)
-	defer func() { internalhandler.JSONResponse(c, ctx) }()
-
-	args := new(UpdateEnvs)
-	data, err := c.GetRawData()
-	if err != nil {
-		log.Errorf("UpdateMultiHelmProduct c.GetRawData() err : %v", err)
-	}
-	if err = json.Unmarshal(data, args); err != nil {
-		log.Errorf("UpdateMultiHelmProduct json.Unmarshal err : %v", err)
-	}
-	internalhandler.InsertOperationLog(c, ctx.Username, c.Param("productName"), "更新helm环境", "集成环境", strings.Join(args.EnvNames, ","), permission.TestEnvManageUUID, string(data), ctx.Logger)
-	c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(data))
-
-	if err := c.BindJSON(args); err != nil {
-		ctx.Logger.Error(err)
-		ctx.Err = e.ErrInvalidParam.AddDesc(err.Error())
-		return
-	}
-
-	ctx.Resp = service.UpdateMultiHelmProduct(args.EnvNames, args.UpdateType, c.Param("productName"), ctx.User.ID, ctx.User.IsSuperUser, ctx.RequestID, ctx.Logger)
-}
-
-func GetProduct(c *gin.Context) {
-	ctx := internalhandler.NewContext(c)
-	defer func() { internalhandler.JSONResponse(c, ctx) }()
-
-	envName := c.Query("envName")
-	productName := c.Param("productName")
-
-	ctx.Resp, ctx.Err = service.GetProduct(ctx.Username, envName, productName, ctx.Logger)
-}
-
-func GetProductInfo(c *gin.Context) {
-	ctx := internalhandler.NewContext(c)
-	defer func() { internalhandler.JSONResponse(c, ctx) }()
-
-	envName := c.Query("envName")
-	productName := c.Param("productName")
-
-	ctx.Resp, ctx.Err = service.GetProductInfo(ctx.Username, envName, productName, ctx.Logger)
-}
-
-func GetProductIngress(c *gin.Context) {
-	ctx := internalhandler.NewContext(c)
-	defer func() { internalhandler.JSONResponse(c, ctx) }()
-
-	productName := c.Param("productName")
-	ctx.Resp, ctx.Err = service.GetProductIngress(ctx.Username, productName, ctx.Logger)
-}
-
-func ListRenderCharts(c *gin.Context) {
-	ctx := internalhandler.NewContext(c)
-	defer func() { internalhandler.JSONResponse(c, ctx) }()
-
-	envName := c.Query("envName")
-	productName := c.Param("productName")
-
-	ctx.Resp, ctx.Err = service.ListRenderCharts(productName, envName, ctx.Logger)
-	if ctx.Err != nil {
-		ctx.Logger.Errorf("failed to listRenderCharts %s %s: %v", envName, productName, ctx.Err)
-	}
-}
-
-func GetHelmChartVersions(c *gin.Context) {
-	ctx := internalhandler.NewContext(c)
-	defer func() { internalhandler.JSONResponse(c, ctx) }()
-
-	envName := c.Query("envName")
-	productName := c.Param("productName")
-
-	ctx.Resp, ctx.Err = service.GetHelmChartVersions(productName, envName, ctx.Logger)
-	if ctx.Err != nil {
-		ctx.Logger.Errorf("failed to get helmVersions %s %s: %v", envName, productName, ctx.Err)
-	}
-}
-
-func DeleteProduct(c *gin.Context) {
-	ctx := internalhandler.NewContext(c)
-	defer func() { internalhandler.JSONResponse(c, ctx) }()
-	envName := c.Query("envName")
-
-	internalhandler.InsertOperationLog(c, ctx.Username, c.Param("productName"), "删除", "集成环境", envName, fmt.Sprintf("%s,%s", permission.TestEnvDeleteUUID, permission.ProdEnvDeleteUUID), "", ctx.Logger)
-	ctx.Err = commonservice.DeleteProduct(ctx.Username, envName, c.Param("productName"), ctx.RequestID, ctx.Logger)
-}
-
-func EnvShare(c *gin.Context) {
-	ctx := internalhandler.NewContext(c)
-	defer func() { internalhandler.JSONResponse(c, ctx) }()
-	productName := c.Param("productName")
-
-	args := new(service.ProductParams)
+	args := new(service.UpdateMultiHelmProductArg)
 	data, err := c.GetRawData()
 	if err != nil {
 		log.Errorf("CreateProduct c.GetRawData() err : %v", err)
@@ -328,86 +406,214 @@ func EnvShare(c *gin.Context) {
 	if err = json.Unmarshal(data, args); err != nil {
 		log.Errorf("CreateProduct json.Unmarshal err : %v", err)
 	}
-	internalhandler.InsertOperationLog(c, ctx.Username, productName, "更新", "集成环境-环境授权", args.EnvName, permission.TestEnvShareUUID, string(data), ctx.Logger)
-	c.Request.Body = ioutil.NopCloser(bytes.NewBuffer(data))
+	args.ProductName = projectName
 
-	if productName == "" {
-		ctx.Err = e.ErrInvalidParam.AddDesc("productName can't be empty!")
+	allowedEnvs, found := internalhandler.GetResourcesInHeader(c)
+	if found {
+		allowedSet := sets.NewString(allowedEnvs...)
+		currentSet := sets.NewString(args.EnvNames...)
+		if !allowedSet.IsSuperset(currentSet) {
+			c.String(http.StatusForbidden, "not all input envs are allowed, allowed envs are %v", allowedEnvs)
+			return
+		}
+	}
+
+	internalhandler.InsertOperationLog(c, ctx.UserName, projectName, "更新", "集成环境", strings.Join(args.EnvNames, ","), string(data), ctx.Logger)
+
+	ctx.Resp, ctx.Err = service.UpdateMultipleHelmEnv(
+		ctx.RequestID, args, ctx.Logger,
+	)
+}
+
+func GetProduct(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	projectName := c.Query("projectName")
+	name := c.Param("name")
+
+	ctx.Resp, ctx.Err = service.GetProduct(ctx.UserName, name, projectName, ctx.Logger)
+}
+
+func GetProductInfo(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	envName := c.Param("name")
+	projectName := c.Query("projectName")
+
+	ctx.Resp, ctx.Err = service.GetProductInfo(ctx.UserName, envName, projectName, ctx.Logger)
+}
+
+func GetHelmChartVersions(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	envName := c.Param("name")
+	projectName := c.Query("projectName")
+
+	ctx.Resp, ctx.Err = service.GetHelmChartVersions(projectName, envName, ctx.Logger)
+	if ctx.Err != nil {
+		ctx.Logger.Errorf("failed to get helmVersions %s %s: %v", envName, projectName, ctx.Err)
+	}
+}
+
+func GetEstimatedRenderCharts(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	projectName := c.Query("projectName")
+	if projectName == "" {
+		ctx.Err = e.ErrInvalidParam.AddDesc("projectName can't be empty!")
 		return
 	}
 
-	if err := c.BindJSON(args); err != nil {
-		ctx.Err = e.ErrInvalidParam.AddDesc(err.Error())
-		return
-	}
-
-	if args.EnvName == "" {
+	envName := c.Param("name")
+	if envName == "" {
 		ctx.Err = e.ErrInvalidParam.AddDesc("envName can't be empty!")
 		return
 	}
 
-	ctx.Err = service.UpdateProductPublic(productName, args, ctx.Logger)
+	ctx.Resp, ctx.Err = service.GetEstimatedRenderCharts(projectName, envName, c.Query("serviceName"), ctx.Logger)
+	if ctx.Err != nil {
+		ctx.Logger.Errorf("failed to get estimatedRenderCharts %s %s: %v", envName, projectName, ctx.Err)
+	}
+}
+
+func DeleteProduct(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+
+	envName := c.Param("name")
+	projectName := c.Query("projectName")
+	internalhandler.InsertOperationLog(c, ctx.UserName, projectName, "删除", "集成环境", envName, "", ctx.Logger)
+	ctx.Err = commonservice.DeleteProduct(ctx.UserName, envName, projectName, ctx.RequestID, ctx.Logger)
 }
 
 func ListGroups(c *gin.Context) {
 	ctx := internalhandler.NewContext(c)
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
 
-	productName := c.Param("productName")
-	envName := c.Query("envName")
+	envName := c.Param("name")
+	projectName := c.Query("projectName")
 	serviceName := c.Query("serviceName")
 	perPageStr := c.Query("perPage")
-	perPage := 0
+	pageStr := c.Query("page")
+	var (
+		count   int
+		perPage int
+		err     error
+		page    int
+	)
 	if perPageStr == "" {
 		perPage = setting.PerPage
 	} else {
-		perPage, _ = strconv.Atoi(perPageStr)
+		perPage, err = strconv.Atoi(perPageStr)
+		if err != nil {
+			ctx.Err = e.ErrInvalidParam.AddDesc(fmt.Sprintf("pageStr args err :%s", err))
+			return
+		}
 	}
 
-	pageStr := c.Query("page")
-	page := 0
 	if pageStr == "" {
 		page = 1
 	} else {
-		page, _ = strconv.Atoi(pageStr)
+		page, err = strconv.Atoi(pageStr)
+		if err != nil {
+			ctx.Err = e.ErrInvalidParam.AddDesc(fmt.Sprintf("page args err :%s", err))
+			return
+		}
 	}
 
-	count := 0
-	ctx.Resp, count, ctx.Err = service.ListGroups(serviceName, envName, productName, perPage, page, ctx.Logger)
+	ctx.Resp, count, ctx.Err = service.ListGroups(serviceName, envName, projectName, perPage, page, ctx.Logger)
 	c.Writer.Header().Set("X-Total", strconv.Itoa(count))
 }
 
-func ListGroupsBySource(c *gin.Context) {
+type ListWorkloadsArgs struct {
+	Namespace    string `json:"namespace"    form:"namespace"`
+	ClusterID    string `json:"clusterId"    form:"clusterId"`
+	WorkloadName string `json:"workloadName" form:"workloadName"`
+	PerPage      int    `json:"perPage"      form:"perPage,default:20"`
+	Page         int    `json:"page"         form:"page,default:1"`
+}
+
+func ListWorkloads(c *gin.Context) {
+	ctx := internalhandler.NewContext(c)
+	defer func() { internalhandler.JSONResponse(c, ctx) }()
+	args := new(ListWorkloadsArgs)
+	if err := c.ShouldBindQuery(args); err != nil {
+		ctx.Err = e.ErrInvalidParam.AddDesc(err.Error())
+		return
+	}
+
+	count, services, err := commonservice.ListWorkloads("", args.ClusterID, args.Namespace, "", args.PerPage, args.Page, ctx.Logger, func(workloads []*commonservice.Workload) []*commonservice.Workload {
+		workloadStat, _ := mongodb.NewWorkLoadsStatColl().Find(args.ClusterID, args.Namespace)
+		workloadM := map[string]commonmodels.Workload{}
+		for _, workload := range workloadStat.Workloads {
+			workloadM[workload.Name] = workload
+		}
+
+		// add services in external env data
+		servicesInExternalEnv, _ := mongodb.NewServicesInExternalEnvColl().List(&mongodb.ServicesInExternalEnvArgs{
+			Namespace: args.Namespace,
+			ClusterID: args.ClusterID,
+		})
+
+		for _, serviceInExternalEnv := range servicesInExternalEnv {
+			workloadM[serviceInExternalEnv.ServiceName] = commonmodels.Workload{
+				EnvName:     serviceInExternalEnv.EnvName,
+				ProductName: serviceInExternalEnv.ProductName,
+			}
+		}
+
+		for index, currentWorkload := range workloads {
+			if existWorkload, ok := workloadM[currentWorkload.Name]; ok {
+				workloads[index].EnvName = existWorkload.EnvName
+				workloads[index].ProductName = existWorkload.ProductName
+			}
+		}
+
+		var resp []*commonservice.Workload
+		for _, workload := range workloads {
+			if args.WorkloadName != "" && strings.Contains(workload.Name, args.WorkloadName) {
+				resp = append(resp, workload)
+			} else if args.WorkloadName == "" {
+				resp = append(resp, workload)
+			}
+		}
+
+		return resp
+	})
+	ctx.Resp = &NamespaceResource{
+		Services: services,
+	}
+	ctx.Err = err
+	c.Writer.Header().Set("X-Total", strconv.Itoa(count))
+}
+
+type workloadQueryArgs struct {
+	ProjectName string `json:"projectName"     form:"projectName"`
+	PerPage     int    `json:"perPage" form:"perPage,default=10"`
+	Page        int    `json:"page"    form:"page,default=1"`
+	Filter      string `json:"filter"  form:"filter"`
+}
+
+func ListWorkloadsInEnv(c *gin.Context) {
 	ctx := internalhandler.NewContext(c)
 	defer func() { internalhandler.JSONResponse(c, ctx) }()
 
-	envName := c.Query("envName")
-	productName := c.Param("productName")
+	envName := c.Param("name")
 
-	services, ingresses, err := commonservice.ListGroupsBySource(envName, productName, ctx.Logger)
+	args := &workloadQueryArgs{}
+	if err := c.ShouldBindQuery(args); err != nil {
+		ctx.Err = err
+		return
+	}
+
+	count, services, err := commonservice.ListWorkloadsInEnv(envName, args.ProjectName, args.Filter, args.PerPage, args.Page, ctx.Logger)
 	ctx.Resp = &NamespaceResource{
-		Services:  services,
-		Ingresses: ingresses,
+		Services: services,
 	}
 	ctx.Err = err
-}
-
-func ListProductsSSE(c *gin.Context) {
-	ctx := internalhandler.NewContext(c)
-
-	internalhandler.Stream(c, func(ctx1 context.Context, msgChan chan interface{}) {
-		startTime := time.Now()
-		wait.NonSlidingUntilWithContext(ctx1, func(_ context.Context) {
-			res, err := service.ListProducts(c.Query("productName"), c.DefaultQuery("envType", setting.TestENV), ctx.User.Name, ctx.User.ID, ctx.User.IsSuperUser, ctx.Logger)
-			if err != nil {
-				ctx.Logger.Errorf("[%s] ListProductsSSE error: %v", ctx.Username, err)
-			}
-
-			msgChan <- res
-
-			if time.Since(startTime).Minutes() == float64(60) {
-				ctx.Logger.Warnf("[%s] Query ListProductsSSE API over 60 minutes", ctx.Username)
-			}
-		}, time.Second)
-	}, ctx.Logger)
+	c.Writer.Header().Set("X-Total", strconv.Itoa(count))
 }

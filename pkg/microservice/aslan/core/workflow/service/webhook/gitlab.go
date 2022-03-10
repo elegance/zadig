@@ -29,9 +29,9 @@ import (
 	"github.com/xanzy/go-gitlab"
 	"go.uber.org/zap"
 
+	"github.com/koderover/zadig/pkg/config"
 	commonmodels "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/models"
 	commonrepo "github.com/koderover/zadig/pkg/microservice/aslan/core/common/repository/mongodb"
-	"github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/collie"
 	gitservice "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/git"
 	"github.com/koderover/zadig/pkg/setting"
 	e "github.com/koderover/zadig/pkg/tool/errors"
@@ -61,13 +61,11 @@ func ProcessGitlabHook(payload []byte, req *http.Request, requestID string, log 
 		return err
 	}
 
-	forwardedProto := req.Header.Get("X-Forwarded-Proto")
-	forwardedHost := req.Header.Get("X-Forwarded-Host")
-	baseURI := fmt.Sprintf("%s://%s", forwardedProto, forwardedHost)
-
+	baseURI := config.SystemAddress()
 	var eventPush *EventPush
 	var pushEvent *gitlab.PushEvent
 	var mergeEvent *gitlab.MergeEvent
+	var tagEvent *gitlab.TagEvent
 	var errorList = &multierror.Error{}
 
 	switch event.(type) {
@@ -84,7 +82,7 @@ func ProcessGitlabHook(payload []byte, req *http.Request, requestID string, log 
 		}
 	}
 
-	go collie.CallGitlabWebHook(forwardedProto, forwardedHost, payload, string(eventType), log)
+	//go collie.CallGitlabWebHook(forwardedProto, forwardedHost, payload, string(eventType), log)
 
 	switch event := event.(type) {
 	case *gitlab.PushEvent:
@@ -99,6 +97,8 @@ func ProcessGitlabHook(payload []byte, req *http.Request, requestID string, log 
 		pushEvent = event
 	case *gitlab.MergeEvent:
 		mergeEvent = event
+	case *gitlab.TagEvent:
+		tagEvent = event
 	}
 	//触发更新服务模板webhook
 	if eventPush != nil {
@@ -180,6 +180,26 @@ func ProcessGitlabHook(payload []byte, req *http.Request, requestID string, log 
 		}()
 	}
 
+	if tagEvent != nil {
+		// workflow webhook
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err = TriggerWorkflowByGitlabEvent(tagEvent, baseURI, requestID, log); err != nil {
+				errorList = multierror.Append(errorList, err)
+			}
+		}()
+
+		//test webhook
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err = TriggerTestByGitlabEvent(tagEvent, baseURI, requestID, log); err != nil {
+				errorList = multierror.Append(errorList, err)
+			}
+		}()
+	}
+
 	wg.Wait()
 
 	return errorList.ErrorOrNil()
@@ -255,7 +275,7 @@ func updateServiceTemplateByPushEvent(event *EventPush, log *zap.SugaredLogger) 
 		return err
 	}
 
-	address, err := GetGitlabAddress(gitlabEvent.Project.WebURL)
+	address, err := GetAddress(gitlabEvent.Project.WebURL)
 	if err != nil {
 		log.Errorf("GetGitlabAddress failed, error: %v", err)
 		return err
@@ -280,8 +300,7 @@ func updateServiceTemplateByPushEvent(event *EventPush, log *zap.SugaredLogger) 
 	errs := &multierror.Error{}
 
 	for _, service := range serviceTmpls {
-		srcPath := service.SrcPath
-		_, _, _, _, path, _, err := GetOwnerRepoBranchPath(srcPath)
+		path, err := getServiceSrcPath(service)
 		if err != nil {
 			errs = multierror.Append(errs, err)
 		}
@@ -311,12 +330,10 @@ func updateServiceTemplateByPushEvent(event *EventPush, log *zap.SugaredLogger) 
 }
 
 func GetGitlabServiceTemplates() ([]*commonmodels.Service, error) {
-	opt := &commonrepo.ServiceFindOption{
-		Type:          setting.K8SDeployType,
-		Source:        setting.SourceFromGitlab,
-		ExcludeStatus: setting.ProductStatusDeleting,
+	opt := &commonrepo.ServiceListOption{
+		Source: setting.SourceFromGitlab,
 	}
-	return commonrepo.NewServiceColl().List(opt)
+	return commonrepo.NewServiceColl().ListMaxRevisions(opt)
 }
 
 // SyncServiceTemplateFromGitlab Force to sync Service Template to latest commit and content,
@@ -345,14 +362,9 @@ func SyncServiceTemplateFromGitlab(service *commonmodels.Service, log *zap.Sugar
 		return nil
 	}
 	// 在Ensure过程中会检查source，如果source为gitlab，则同步gitlab内容到service中
-	if err := fillServiceTmpl(service, log); err != nil {
+	if err := fillServiceTmpl(setting.WebhookTaskCreator, service, log); err != nil {
 		log.Errorf("ensureServiceTmpl error: %+v", err)
 		return e.ErrValidateTemplate.AddDesc(err.Error())
-	}
-	// 更新到数据库，revision+1
-	if err := commonrepo.NewServiceColl().Create(service); err != nil {
-		log.Errorf("Failed to sync service %s from gitlab path %s error: %v", service.ServiceName, service.SrcPath, err)
-		return e.ErrCreateTemplate.AddDesc(err.Error())
 	}
 	log.Infof("End of sync service template %s from gitlab path %s", service.ServiceName, service.SrcPath)
 	return nil

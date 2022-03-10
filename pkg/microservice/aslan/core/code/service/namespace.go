@@ -23,7 +23,7 @@ import (
 
 	"github.com/koderover/zadig/pkg/microservice/aslan/config"
 	git "github.com/koderover/zadig/pkg/microservice/aslan/core/common/service/github"
-	"github.com/koderover/zadig/pkg/shared/codehost"
+	"github.com/koderover/zadig/pkg/shared/client/systemconfig"
 	"github.com/koderover/zadig/pkg/tool/codehub"
 	e "github.com/koderover/zadig/pkg/tool/errors"
 	"github.com/koderover/zadig/pkg/tool/gerrit"
@@ -35,22 +35,17 @@ const (
 	OrgKind         = "org"
 	GroupKind       = "group"
 	UserKind        = "user"
-	page            = 1
-	perPage         = 100
 	CodeHostCodeHub = "codehub"
 )
 
 func CodeHostListNamespaces(codeHostID int, keyword string, log *zap.SugaredLogger) ([]*Namespace, error) {
-	opt := &codehost.Option{
-		CodeHostID: codeHostID,
-	}
-	ch, err := codehost.GetCodeHostInfo(opt)
+	ch, err := systemconfig.New().GetCodeHost(codeHostID)
 	if err != nil {
 		return nil, e.ErrCodehostListNamespaces.AddDesc("git client is nil")
 	}
 
 	if ch.Type == codeHostGitlab {
-		client, err := gitlab.NewClient(ch.Address, ch.AccessToken)
+		client, err := gitlab.NewClient(ch.Address, ch.AccessToken, config.ProxyHTTPSAddr(), ch.EnableProxy)
 		if err != nil {
 			log.Error(err)
 			return nil, e.ErrCodehostListNamespaces.AddDesc(err.Error())
@@ -68,7 +63,7 @@ func CodeHostListNamespaces(codeHostID int, keyword string, log *zap.SugaredLogg
 			Kind: OrgKind,
 		}}, nil
 	} else if ch.Type == CodeHostCodeHub {
-		codeHubClient := codehub.NewCodeHubClient(ch.AccessKey, ch.SecretKey, ch.Region)
+		codeHubClient := codehub.NewCodeHubClient(ch.AccessKey, ch.SecretKey, ch.Region, config.ProxyHTTPSAddr(), ch.EnableProxy)
 		codeHubNamespace, err := codeHubClient.NamespaceList()
 		if err != nil {
 			return nil, err
@@ -76,7 +71,7 @@ func CodeHostListNamespaces(codeHostID int, keyword string, log *zap.SugaredLogg
 		return ToNamespaces(codeHubNamespace), nil
 	} else {
 		//	github
-		gh := git.NewClient(ch.AccessToken, config.ProxyHTTPSAddr())
+		gh := git.NewClient(ch.AccessToken, config.ProxyHTTPSAddr(), ch.EnableProxy)
 		namespaces := make([]*Namespace, 0)
 
 		user, err := gh.GetAuthenticatedUser(context.TODO())
